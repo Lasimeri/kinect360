@@ -1,0 +1,12 @@
+# what make builds, every run's logs and dumps (frames of the room live there: never published)
+out/
+# this machine's calibration and aligned pose
+calib/
+# the YuNet model: models/fetch.sh downloads and checks it
+models/*.onnx
+models/*.part
+# driver packages: only the recipe generator is published (pkg/gen-recipes.sh); the AUR originals are cloned
+# beside it, and pkg/local holds sources, the Kinect SDK installer (Microsoft's, not redistributable) and builds
+pkg/*
+!pkg/gen-recipes.sh
+compile_commands.json

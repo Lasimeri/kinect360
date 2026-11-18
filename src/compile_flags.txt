@@ -1,0 +1,11 @@
+-std=gnu11
+-Wall
+-Wextra
+-Wshadow
+-Wformat=2
+-Wundef
+-Wstrict-prototypes
+-isystem/usr/include/libfreenect
+-isystem../third_party/fsr3of/src/engine
+-isystem../third_party/fsr3of/src/kern
+-isystem../third_party/fsr3of/src/common

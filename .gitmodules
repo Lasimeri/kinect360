@@ -1,0 +1,6 @@
+[submodule "third_party/fsr3of"]
+	path = third_party/fsr3of
+	url = https://github.com/Lasimeri/FSR3-Optical_Flow-AVX2-FMA3.git
+[submodule "third_party/visiontrack"]
+	path = third_party/visiontrack
+	url = https://github.com/Lasimeri/Intel-Phi-VisionTrack.git
