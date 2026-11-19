@@ -4,7 +4,7 @@ CC      = gcc
 CFLAGS  = -std=gnu11 -O2 -Wall -Wextra -Wshadow -Wformat=2 -Wundef -Wstrict-prototypes -Werror \
           -isystem /usr/include/libfreenect
 LDLIBS  = -lfreenect -lglfw -lOpenGL -lturbojpeg -lm -pthread
-SHADERS = mesh_a.vert mesh_a.geom mesh_b.vert mesh.frag scatter.comp check.comp pip.vert pip.frag winner.comp pmap.comp wz.comp dfill.comp syn.frag comp.comp gn.comp sflow.comp cells.comp arrow.vert arrow.frag fg.comp \
+SHADERS = mesh_a.vert mesh_a.geom mesh_b.vert mesh.frag scatter.comp check.comp pip.vert pip.frag winner.comp pmap.comp wz.comp dfill.comp syn.frag comp.comp gn.comp sflow.comp cells.comp arrow.vert arrow.frag fg.comp dmov.comp cmap.comp \
           fl_gray.comp fl_pyr.comp fl_scharr.comp fl_lk.comp fl_fb.comp
 
 SRCS    = src/kinect3d.c src/webcam.c src/flow.c src/fsrflow.c
@@ -115,3 +115,5 @@ compdb:
 	@echo "compile_commands.json: $$(grep -c '"file"' compile_commands.json) entries"
 
 .PHONY: compdb
+out/edgeoff: tools/edgeoff.c
+	tcc -Wall -Werror -o $@ $< -lm

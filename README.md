@@ -71,6 +71,7 @@ out/kinect3d --fg-test 30          # frame generation against ground truth (belo
 | F | depth filter |
 | G | frame generation on/off |
 | T | geometry at the colour's instant on/off |
+| A | solve the webcam's pose from the still scene again |
 | V | velocity arrows |
 | N | camera panels: feeds (with the face boxes) / flow / off |
 | M | mesh path A / B (same picture; B is the selftest's oracle) |
@@ -84,7 +85,9 @@ out/kinect3d --fg-test 30          # frame generation against ground truth (belo
 | `--calib FILE\|none` | webcam pose; default `calib/webcam-aligned.txt` if it exists, else `calib/webcam.txt` |
 | `--flow-source fsr\|lk` | velocity field from the FSR 3 flow (default) or the GPU Lucas-Kanade flow |
 | `--fsr-vec smooth\|lk-all\|lk\|gen\|lk-ema\|gen-ema\|ema` | the FSR flow's vectors (below); default `smooth` |
-| `--no-fg`, `--no-geo-time`, `--no-face-track`, `--no-align`, `--raw-vel` | turn a part off (`--raw-vel`: the cells' velocities unsmoothed) |
+| `--no-fg`, `--no-geo-time`, `--no-face-track`, `--no-align`, `--raw-vel`, `--no-still-depth`, `--no-edge-pull`, `--no-uv-time` | turn a part off (`--raw-vel`: the cells' velocities unsmoothed) |
+| `--ghost-test`, `--splat-stats N` | the depth filter on made depth; colour splatter at the live scene's silhouettes |
+| `--fg-fallback` | generated pictures fall back where their two halves disagree (off: measured 0.9 dB worse) |
 | `--fg-test S`, `--face-stats S`, `--scene-stats N` | measurements, then exit |
 | `--dump-align DIR` | one frame of each camera, the point map and the pose, for `out/alscape` |
 | `--calib-face DIR S`, `--calib-track DIR S`, `--calib-dump DIR` | calibration captures (`make calibrate-face`, `calibrate-track`, `calibrate`) |
@@ -135,6 +138,28 @@ colour on screen (prev, the generated midpoint, or cur), so geometry and texture
 frame (gravity from the Kinect's accelerometer, signs checked against the depth-measured ceiling normal, wall yaw
 folded mod 90 deg; the same rotation for both frames unless the motor moves). Cells of 8 x 8 pixels; a cell moves
 above 150 + 40 z^2 mm/s (z in m), a threshold shaped like the measured noise floor.
+
+**Depth without ghosts: still pictures.** The depth filter follows the still pictures of VisionTrack's depth map
+(`src/kern/still.c`: a running mean per camera that motion gates), on the Kinect's depth. Each pixel keeps the mean
+of the frames it has held still (weight 1 / min(count, 16)); motion is judged per 8 x 8 cell: 6 of its 64 pixels
+leaving their mean by more than 3 depth steps, and at least 2 such cells in a 3 x 3 (a cell with 16 changed
+pixels counts as two). A moving cell's means restart from the frame itself, and nothing is held there. A pixel
+that drops out keeps its mean only in a cell that is not moving, for at most 15 frames. The filter before it held
+every dropped pixel for 2 frames wherever it was, which left an outline behind everything that moved.
+
+**Colour without splatter.** Three causes, three measures:
+- *The depth outline overhangs the colour outline.* Within 4.5 pixels of the end of its surface (invalid depth,
+  the shadow beside every near thing, or a depth step above max(100 mm, 5 %)), a pixel's colour lookup moves
+  inward until it is 4.5 px inside its own surface.
+- *The colour on screen is of another instant than the depth* (up to one frame, since frame generation shows the
+  previous, the generated and the newest picture in turn). Where the depth says something moved, the lookup
+  follows the surface to the picture's instant along the colour's own flow.
+- *The webcam's pose.* The fill paints the Kinect colour camera's blind spots from the webcam, so a wrong pose
+  paints near things onto far ones. The pose is now also solved from the still scene, with no face: the gradient
+  correlation of the two colour cameras through the Kinect's depth, over every point from 0.3 m (near and far
+  points together separate rotation from translation), a whole-picture search then Nelder-Mead over six
+  parameters, fitted on one colour of a 16 px checkerboard and judged on the other. It runs once at start (about
+  0.35 s) and on the A key, and is applied when the held-out correlation rises by 0.05.
 
 **Face tracker.** VisionTrack's region tracker (`src/kern/track.c` with its LK, Kalman and take-back, unmodified)
 runs per camera on a worker thread; YuNet places its box on the face and places it again when the region is lost
@@ -228,6 +253,25 @@ room, median / 90th percentile of |v|, mm/s):
 | 2-3 m | 48.8 / 250.5, 46.6 / 236.3 | 25.4 / 124.9, 27.7 / 135.2 |
 | >= 3 m | 94.3 / 328.1, 90.5 / 302.3 | 58.1 / 139.2, 58.6 / 151.7 |
 
+**Ghosts and splatter.** `--ghost-test` runs the real depth passes on made depth with a known truth: a near
+square crossing a far plane at 8 px a frame leaves 1,080.0 ghost pixels a frame behind it with the old filter and
+0.0 with the still pictures; on a still plane with noise of one depth step and 5 % drop-outs the error falls from
+0.578 depth steps (raw) to 0.239 (old) and 0.107 (still pictures), both with depth on 100 % of the plane.
+`--splat-stats 150` asks, at every depth silhouette of the live scene, whether a pixel wears its own surface's
+colour or the other's (reference colours 6 px inside each surface, only where they differ clearly; texture alone
+keeps it above 0). Two interleaved rounds, old mapping against new:
+
+| Pixels wearing the other surface's colour | at the edge | 1 px inside | 2 px inside |
+|---|---|---|---|
+| near surface, old | 52.9 %, 54.9 % | 41.8 %, 42.7 % | 27.4 %, 28.1 % |
+| near surface, new | 10.1 %, 10.1 % | 8.9 %, 8.8 % | 7.9 %, 7.8 % |
+| far surface, old | 18.5 %, 18.4 % | 13.7 %, 13.3 % | 10.7 %, 10.2 % |
+| far surface, new | 6.2 %, 6.3 % | 5.2 %, 5.3 % | 4.6 %, 4.8 % |
+
+The still-scene pose: held-out correlation 0.344 to 0.588, a change of 1.15 deg and 86 mm; the webcam-filled far
+pixels in the near surface's colours fell from 57.8 % to between 18.5 and 37.8 % (it varies that much from run to
+run with the scene). `out/edgeoff` on a still dump puts the colour's edges 1 to 2 px from the depth's.
+
 **Geometry at the colour's instant** (`--fg-test 15`, with and without `--no-geo-time`): 63.0 distinct geometry
 states a second on screen against 30.0, the mean shift 18.2 ms.
 
@@ -250,6 +294,9 @@ gradient correlation has one sharp peak (0.745, the best point outside 16 px 0.5
 
 - The joint face plus background solve has been built but not yet seen deciding live: the one run so far had no
   face in the webcam's view.
+- The colour lookup's time shift is built on the measured flow but its own effect under motion is not measured (the
+  rooms it ran in were nearly still); the webcam fill's remaining splatter is not separated from the two cameras'
+  colour differences.
 - Geometry at the colour's instant moves vertices by their cell's velocity; the depth surface itself still
   changes 30 times a second. Its picture quality has no ground truth test yet, only the count of states.
 - The window's memory grew by about 78 MB an hour in one 90 minute session (2 samples of an earlier build): not
@@ -269,6 +316,7 @@ gradient correlation has one sharp peak (0.745, the best point outside 16 px 0.5
 | `src/webcam.[ch]`, `src/facetrack.[ch]pp` | V4L2 MJPEG capture, YuNet behind a C API |
 | `src/kinect-probe.c`, `kinect-streams.c`, `v4l2-probe.c`, `holes.c`, `shiftsearch.c` | probes (tcc) |
 | `tools/vectest.c` | motion vector ground truth |
+| `tools/edgeoff.c` | where the colour's edges lie relative to the depth's silhouettes |
 | `tools/alscape.c`, `tools/posediff.c` | the alignment's evidence: background correlation landscape, pose disagreement by depth |
 | `tools/kcalib.cpp`, `tools/flowcheck.cpp`, `tools/facetest.cpp` | calibration solver, flow oracle, YuNet check |
 | `tools/boxlink.c` | checks that a box-drawing diagram's connectors meet (the one above: 0 faults) |

@@ -66,9 +66,10 @@ static const char GLSL_COMMON[] =
 	"uniform float u_k;\n"
 	"uniform float u_cull;\n"
 	"uniform int u_occl;\n"
-	"struct Pix { uint wz; bool ok; int s; int cx; int cy; bool inb; };\n"
+	"struct Pix { uint wz; bool ok; int s; int cx; int cy; bool inb; ivec2 p; };\n"
 	"Pix pix(ivec2 p) {\n"
 	"  Pix r;\n"
+	"  r.p = p;\n"
 	"  r.wz = texelFetch(t_depth, p, 0).r;\n"
 	"  r.ok = r.wz != 0u && r.wz < 10000u;\n"
 	"  ivec2 rg = texelFetch(t_reg, p, 0).xy;\n"
@@ -92,8 +93,41 @@ static const char GLSL_COMMON[] =
 	"  uint mn = min(a, min(b, c)), mx = max(a, max(b, c));\n"
 	"  return mn != 0u && mx < 10000u && float(mx - mn) <= u_cull * float(mn);\n"
 	"}\n"
+	/* Where a depth pixel's colour is read (display passes only: both uniforms are 0 elsewhere).
+	 * u_pull: within 4.5 pixels of the end of its surface (a depth pixel that is invalid, the shadow beside every near
+	 * thing, or differs by more than max(100 mm, 5 %))
+	 * the lookup moves away until it is 4.5 px from it: measured (--splat-stats), 64-67 % of a near surface's edge
+	 * pixels and 36-38 % of those 2 px inside wore the far surface's colour: the depth silhouette overhangs the colour's, and that is
+	 * the difference between a surface's own colour and its neighbour's.
+	 * u_uvt = (instant of the depth frame - instant of the colour on screen) / the colour's frame period: the
+	 * colour's own flow (t_kvec, px a frame, newer -> older) says where this surface point is in that picture. */
+	"layout(binding = 17) uniform sampler2D t_kvec;\n"
+	"layout(binding = 18) uniform sampler2D t_dmov;\n" /* the cells' motion evidence (dmov.comp) */
+	"uniform int u_pull;\n"
+	"uniform float u_uvt;\n"
 	"void attrs(Pix q, out vec2 uv, out float occl) {\n"
-	"  uv = vec2(float(q.s) * (1.0 / (256.0 * 640.0)), (float(q.cy) + 0.5) * (1.0 / 480.0));\n"
+	"  vec2 c = vec2(float(q.s) * (1.0 / 256.0), float(q.cy) + 0.5);\n"
+	"  if (u_pull != 0 && q.ok && q.inb) {\n"
+	"    float z = float(q.wz), lim = max(100.0, 0.05 * z), near = 99.0;\n"
+	"    vec2 away = vec2(0.0);\n"
+	"    for (int dy = -4; dy <= 4; dy++)\n"
+	"      for (int dx = -4; dx <= 4; dx++) {\n"
+	"        uint zn = texelFetch(t_depth, clamp(q.p + ivec2(dx, dy), ivec2(0), ivec2(639, 479)), 0).r;\n"
+	"        if (zn != 0u && zn < 10000u && abs(float(zn) - z) <= lim) continue;\n" /* this surface */
+	"        vec2 o = vec2(float(dx), float(dy));\n"
+	"        float d = length(o);\n"
+	"        away -= o / (d * d);\n" /* the nearest pixels off the surface decide the direction */
+	"        near = min(near, d);\n"
+	"      }\n"
+	"    if (near < 4.5) c += (4.5 - near) * normalize(away + vec2(1e-6));\n" /* every lookup ends at least 4.5 px inside its own surface */
+	"  }\n"
+	"  if (u_uvt != 0.0) {\n" /* only where the depth says something moved (this cell or a neighbour): a still surface's texture stays put whatever the flow's noise says */
+	"    float ev = 0.0;\n"
+	"    for (int dy = -1; dy <= 1; dy++)\n"
+	"      for (int dx = -1; dx <= 1; dx++) ev += step(0.7, texelFetch(t_dmov, clamp((q.p >> 3) + ivec2(dx, dy), ivec2(0), ivec2(79, 59)), 0).r);\n"
+	"    if (ev > 0.5) c += u_uvt * texture(t_kvec, c * vec2(1.0 / 640.0, 1.0 / 480.0)).xy;\n"
+	"  }\n"
+	"  uv = c * vec2(1.0 / 640.0, 1.0 / 480.0);\n"
 	"  occl = 1.0;\n"
 	"  if (q.ok && q.inb)\n"
 	/* occluded = behind the nearest surface at this RGB pixel by more than max(50 mm, 3 depth steps): two
@@ -129,6 +163,8 @@ static const char GLSL_COMMON[] =
 	"  vec3 w = wproj(kworld(p, q.wz));\n"
 	"  ivec2 h = whalf(w.xy);\n"
 	"  if (w.z <= 50.0 || !whalf_in(h)) return;\n"
+	/* no pull here: moving the webcam's lookup 7 px off nearer outlines in its view measured no better (webcam-filled far pixels in
+	 * the near surface's colours 35.6 / 34.8 % with it, 27.5 / 31.8 % without; the run-to-run spread is 18.5 to 37.8 %) */
 	"  wuv = (w.xy + 0.5) / vec2(640.0, 480.0);\n"
 	"  wvis = w.z <= float(texelFetch(t_wz, h, 0).r) * 1.02 + 15.0 ? 1.0 : 0.0;\n"
 	"}\n";
@@ -224,13 +260,47 @@ static const char BODY_MESH_FRAG[] =
  * depth on both sides within u_fill px (rows first, then columns) is interpolated when the two sides
  * agree within max(30 mm, 3 %), so silhouettes are never bridged. Temporal: a new depth within 3
  * quantisation steps (z^2 / 348000 mm) of the history is blended (u_alpha); larger changes pass at
- * once (motion). A pixel that drops out keeps its last depth for up to 2 frames. State: rg32f (z, age). */
+ * once (motion). A pixel that drops out keeps its last depth for up to 2 frames (u_still 0).
+ *
+ * u_still 1 (default): the still pictures of the VisionTrack project's depth map (src/kern/still.c), on the Kinect's
+ * depth. Each pixel keeps a running mean of the frames it has held still: weight 1 / min(count, 16), the first
+ * frame in a pixel is that frame exactly. Motion decides what enters it, per 8 x 8 cell (dmov.comp): a cell has
+ * evidence when 6 of its 64 pixels left their mean by more than 3 depth steps, or the colour flow (1.5 px, below)
+ * there says so; at least 2 such cells in its 3 x 3 make it moving (noise rarely covers two; a cell with 16
+ * changed pixels counts as two: the corner of a moving thing has one neighbour), and a
+ * moving cell's means restart from this frame. A drop-out alone is no evidence: the Kinect drops pixels by
+ * itself. A pixel that drops out keeps its mean only in a cell that is not moving, with at least 4 frames in it,
+ * for at most 15 frames: nothing a moving thing leaves behind is held, which is what the fixed 2-frame hold did
+ * at every silhouette. State: rgba32f (mean, frames in it, frames held). */
+static const char BODY_DMOV_COMP[] =
+	"layout(local_size_x = 8, local_size_y = 4) in;\n"
+	"layout(binding = 13) uniform usampler2D t_draw;\n"
+	"layout(binding = 7, rgba32f) uniform readonly image2D i_dtemp;\n"
+	"layout(binding = 1, r8) uniform writeonly image2D i_dmov;\n"
+	"void main() {\n"
+	"  ivec2 c = ivec2(gl_GlobalInvocationID.xy);\n"
+	"  int changed = 0;\n"
+	"  for (int y = 0; y < 8; y++)\n"
+	"    for (int x = 0; x < 8; x++) {\n"
+	"      ivec2 p = c * 8 + ivec2(x, y);\n"
+	"      uint z = texelFetch(t_draw, p, 0).r;\n"
+	"      if (z == 0u || z >= 10000u) continue;\n"
+	"      vec4 h = imageLoad(i_dtemp, p);\n"
+	"      float zf = float(z);\n"
+	"      changed += (h.r > 0.0 && abs(zf - h.r) > 3.0 * zf * zf / 348000.0) ? 1 : 0;\n" /* a pixel appearing is no evidence either: validity flickers by itself */
+	"    }\n"
+	"  Pix q = pix(c * 8 + 4);\n" /* the colour flow where this cell's centre was seen (the depth before this frame) */
+	"  float flow = (q.ok && q.inb) ? length(texture(t_kvec, vec2(float(q.cx) + 0.5, float(q.cy) + 0.5) * vec2(1.0 / 640.0, 1.0 / 480.0)).xy) : 0.0;\n"
+	"  imageStore(i_dmov, c, vec4(changed >= 16 ? 1.0 : changed >= 6 ? 0.8 : flow > 1.5 ? 0.6 : 0.0));\n" /* 1 a quarter of the cell changed (noise cannot: counts as two), 0.8 depth evidence, 0.6 flow alone (0.5 px: 542 cells a frame in a still room, 11 %: the dim picture's noise) */
+	"}\n";
+
 static const char BODY_DFILL_COMP[] =
 	"layout(local_size_x = 16, local_size_y = 16) in;\n"
 	"layout(binding = 13) uniform usampler2D t_draw;\n"
 	"layout(binding = 6, r16ui) uniform writeonly uimage2D i_dout;\n"
-	"layout(binding = 7, rg32f) uniform image2D i_dtemp;\n"
+	"layout(binding = 7, rgba32f) uniform image2D i_dtemp;\n"
 	"uniform int u_fill;\n"
+	"uniform int u_still;\n"
 	"uniform float u_alpha;\n"
 	"uint dr(ivec2 p) { return texelFetch(t_draw, clamp(p, ivec2(0), ivec2(639, 479)), 0).r; }\n"
 	"bool dok(uint z) { return z != 0u && z < 10000u; }\n"
@@ -262,12 +332,46 @@ static const char BODY_DFILL_COMP[] =
 	"  if (zf == 0.0 && u_fill > 0) {\n"
 	"    zf = fill2d(p);\n"
 	"  }\n"
-	"  vec2 h = imageLoad(i_dtemp, p).rg;\n"
-	"  float age = 0.0;\n"
-	"  if (zf > 0.0 && h.r > 0.0 && abs(zf - h.r) <= 3.0 * zf * zf / 348000.0) zf = mix(h.r, zf, u_alpha);\n"
-	"  else if (zf == 0.0 && h.r > 0.0 && h.g < 2.0 && u_alpha < 1.0) { zf = h.r; age = h.g + 1.0; }\n"
-	"  imageStore(i_dtemp, p, vec4(zf, age, 0.0, 0.0));\n"
+	"  vec4 h = imageLoad(i_dtemp, p);\n"
+	"  float age = 0.0, held = 0.0;\n"
+	"  if (u_still != 0) {\n"
+	"    ivec2 c = p >> 3;\n"
+	"    float ev = 0.0;\n"
+	"    for (int dy = -1; dy <= 1; dy++)\n"
+	"      for (int dx = -1; dx <= 1; dx++) { float e = texelFetch(t_dmov, clamp(c + ivec2(dx, dy), ivec2(0), ivec2(79, 59)), 0).r; ev += e > 0.9 ? 2.0 : step(0.5, e); }\n"
+	"    bool moving = ev > 1.5;\n"
+	"    if (zf > 0.0) {\n"
+	"      if (!moving && h.r > 0.0 && abs(zf - h.r) <= 3.0 * zf * zf / 348000.0) { age = min(h.g + 1.0, 16.0); zf = h.r + (zf - h.r) / age; }\n"
+	"      else age = 1.0;\n"
+	"    } else if (!moving && h.r > 0.0 && h.g >= 4.0 && h.b < 15.0) { zf = h.r; age = h.g; held = h.b + 1.0; }\n"
+	"  } else {\n"
+	"    if (zf > 0.0 && h.r > 0.0 && abs(zf - h.r) <= 3.0 * zf * zf / 348000.0) zf = mix(h.r, zf, u_alpha);\n"
+	"    else if (zf == 0.0 && h.r > 0.0 && h.g < 2.0 && u_alpha < 1.0) { zf = h.r; age = h.g + 1.0; }\n"
+	"  }\n"
+	"  imageStore(i_dtemp, p, vec4(zf, age, held, 0.0));\n"
 	"  imageStore(i_dout, p, uvec4(uint(round(zf)), 0u, 0u, 0u));\n"
+	"}\n";
+
+/* the colour each depth pixel is drawn with (what the mesh's vertices carry), for the splatter measurement */
+static const char BODY_CMAP_COMP[] =
+	"layout(local_size_x = 16, local_size_y = 16) in;\n"
+	"layout(binding = 1, rgba8) uniform writeonly image2D i_out;\n"
+	"void main() {\n"
+	"  ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
+	"  Pix q = pix(p);\n"
+	"  vec4 o = vec4(0.0);\n"
+	"  if (q.ok && q.inb) {\n"
+	"    vec2 uv, wuv;\n"
+	"    float occl, wvis;\n"
+	"    attrs(q, uv, occl);\n"
+	"    wattrs(p, q, wuv, wvis);\n"
+	"    vec3 kc = texture(t_rgb, uv).rgb;\n"
+	"    vec3 wc = clamp(texture(t_wrgb, wuv).rgb * u_wgain + u_woff, 0.0, 1.0);\n"
+	"    float ww = u_occl >= 2 ? wvis : 0.0;\n"
+	"    if (occl < 0.5) o = vec4(kc, 1.0);\n"                 /* alpha: 1 Kinect colour, 0.5 webcam fill, 0 none */
+	"    else if (ww > 0.5) o = vec4(wc, 0.5);\n"
+	"  }\n"
+	"  imageStore(i_out, p, o);\n"
 	"}\n";
 
 /* inverse registration: which depth pixel won each RGB pixel's z-buffer (lowest index on ties) */
@@ -565,12 +669,25 @@ static const char BODY_FG_COMP[] =
 	"layout(binding = 15) uniform sampler2D t_mid;\n"
 	"layout(binding = 1, rgba8) uniform writeonly image2D i_gen;\n"
 	"layout(location = 0) uniform float u_sign; /* 1; -1 only in the test control */\n"
+	"layout(location = 1) uniform int u_fb;\n"
 	"void main() {\n"
 	"  ivec2 p = ivec2(gl_GlobalInvocationID.xy);\n"
 	"  vec2 sz = vec2(640.0, 480.0), x = vec2(p) + 0.5;\n"
 	"  vec2 v = u_sign * texture(t_mid, x / sz).xy;\n"
 	"  vec3 a = texture(t_older, (x + 0.5 * v) / sz).rgb, b = texture(t_newer, (x - 0.5 * v) / sz).rgb;\n"
-	"  imageStore(i_gen, p, vec4(0.5 * (a + b), 1.0));\n"
+	"  vec3 m = 0.5 * (a + b);\n"
+	/* where the two moved pictures disagree the vector is wrong there (a block straddling a moving thing's outline
+	 * drags the background with it), and their mean is a double image. If the two pictures agree better unmoved,
+	 * it is still background: their unmoved mean. Otherwise the newer picture alone: sharp, not doubled. */
+	"  if (u_fb != 0) {\n"
+	"    float d = dot(abs(a - b), vec3(1.0));\n"
+	"    if (d > 0.12) {\n"
+	"      vec3 a0 = texture(t_older, x / sz).rgb, b0 = texture(t_newer, x / sz).rgb;\n"
+	"      float d0 = dot(abs(a0 - b0), vec3(1.0));\n"
+	"      m = mix(m, d0 < d ? 0.5 * (a0 + b0) : b, smoothstep(0.12, 0.24, d));\n"
+	"    }\n"
+	"  }\n"
+	"  imageStore(i_gen, p, vec4(m, 1.0));\n"
 	"}\n";
 
 static const struct { const char *file; GLenum stage; const char *body; } STAGES[] = {
@@ -594,8 +711,10 @@ static const struct { const char *file; GLenum stage; const char *body; } STAGES
 	{"arrow.vert", GL_VERTEX_SHADER, BODY_ARROW_VERT},
 	{"arrow.frag", GL_FRAGMENT_SHADER, BODY_ARROW_FRAG},
 	{"fg.comp", GL_COMPUTE_SHADER, BODY_FG_COMP},
+	{"dmov.comp", GL_COMPUTE_SHADER, BODY_DMOV_COMP},
+	{"cmap.comp", GL_COMPUTE_SHADER, BODY_CMAP_COMP},
 };
-enum { S_AV, S_AG, S_BV, S_FR, S_SC, S_CK, S_PV, S_PF, S_WN, S_PM, S_WZ, S_DF, S_SY, S_CO, S_GN, S_SF, S_CE, S_AWV, S_AWF, S_FG, NSTAGE };
+enum { S_AV, S_AG, S_BV, S_FR, S_SC, S_CK, S_PV, S_PF, S_WN, S_PM, S_WZ, S_DF, S_SY, S_CO, S_GN, S_SF, S_CE, S_AWV, S_AWF, S_FG, S_DM, S_CM, NSTAGE };
 
 static int dump_shaders(const char *dir)
 {
@@ -741,6 +860,9 @@ static float g_k, g_cull = 0.04f;
 static int g_occl = 1, g_method = DEFAULT_METHOD;
 static GLuint t_win, t_wz, t_pmap, p_win, p_pmap, p_wz, t_draw, t_dtemp, p_dfill;
 static int g_dfilter = 1;
+static GLuint p_cmap, p_dmov, t_dmov;
+static int g_still = 1, g_pull = 1, g_uvc = 1; /* still-picture depth, the colour lookup pulled off silhouettes, and shifted to the picture's instant */
+static float g_uvt;
 static GLuint t_dprev, t_winprev, t_vel, t_pos, t_cv, t_cp, p_sflow, p_cells, p_arrow;
 static GLuint p_syn, p_comp, p_gn, fbo_syn, t_sgray, t_sX, t_synf, ssbo_part;
 static flowcam *g_flock;
@@ -828,6 +950,8 @@ static void gl_setup(void)
 	p_pmap = build_program(S_PM, -1, -1);
 	p_wz = build_program(S_WZ, -1, -1);
 	p_dfill = build_program(S_DF, -1, -1);
+	p_dmov = build_program(S_DM, -1, -1);
+	p_cmap = build_program(S_CM, -1, -1);
 	p_syn = build_program(S_AV, S_AG, S_SY);
 	p_comp = build_program(S_CO, -1, -1);
 	p_gn = build_program(S_GN, -1, -1);
@@ -863,10 +987,12 @@ static void gl_setup(void)
 	glBindImageTexture(4, t_pmap, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
 	glBindImageTexture(5, t_wz, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
 	t_draw = tex2d(GL_R16UI, W, H, 0);
-	t_dtemp = tex2d(GL_RG32F, W, H, 0);
+	t_dtemp = tex2d(GL_RGBA32F, W, H, 0);
+	t_dmov = tex2d(GL_R8, 80, 60, 0);
+	glBindTextureUnit(18, t_dmov);
 	glBindTextureUnit(13, t_draw);
 	glBindImageTexture(6, t_depth, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R16UI);
-	glBindImageTexture(7, t_dtemp, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG32F);
+	glBindImageTexture(7, t_dtemp, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
 	GLuint units[5] = {t_depth, t_reg, t_shift, t_zmin, t_rgb};
 	for (GLuint u = 0; u < 5; u++) glBindTextureUnit(u, units[u]);
 	glBindImageTexture(0, t_zmin, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
@@ -919,6 +1045,11 @@ static void upload_depth(const uint8_t *d)
 	glBindTextureUnit(13, t_draw); /* shared unit: every pass binds its own */
 	glProgramUniform1i(p_dfill, glGetUniformLocation(p_dfill, "u_fill"), g_dfilter ? 16 : 0);
 	glProgramUniform1f(p_dfill, glGetUniformLocation(p_dfill, "u_alpha"), g_dfilter ? 0.3f : 1.0f);
+	glProgramUniform1i(p_dfill, glGetUniformLocation(p_dfill, "u_still"), g_dfilter && g_still);
+	glBindImageTexture(1, t_dmov, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R8); /* the cells' motion evidence, before the filter reads it */
+	glUseProgram(p_dmov);
+	glDispatchCompute(10, 15, 1);
+	glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 	glUseProgram(p_dfill);
 	glDispatchCompute(W / 16, H / 16, 1);
 	glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT);
@@ -940,11 +1071,80 @@ static void upload_depth(const uint8_t *d)
 
 static void upload_rgb(const uint8_t *v) { glTextureSubImage2D(t_rgb, 0, 0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, v); }
 
+
+/* ==== splatter measurement (--splat-stats N) =====================================================
+ * At every depth silhouette (a surface whose next valid depth pixel along a row or column, within 12 px, is
+ * farther by more than max(150 mm, 10 %)), with the colours the mesh draws (cmap.comp): does a pixel wear its own
+ * surface's colour or the other's? Reference colours: 6 px inside each surface. Only where those two differ by
+ * 90 or more (sum of |RGB| differences), or nothing can be told. For 0, 1 and 2 px from the edge on each side:
+ * the share of pixels nearer in colour to the other surface. A ghost (stale depth left by something that moved
+ * away) reads as a near surface in the far one's colours, a bad mapping as either. Texture alone gives a floor
+ * above 0, so the number is for comparing mappings on the same scene, not an absolute. */
+static struct { unsigned long tested[2][3], bad[2][3], wt[2], wb[2], frames, moving_cells, flow_cells; } g_sp; /* wt, wb: the webcam-filled pixels among them */
+
+static inline int l1rgb(const uint8_t *a, const uint8_t *b) { return abs(a[0] - b[0]) + abs(a[1] - b[1]) + abs(a[2] - b[2]); }
+
+static void splat_measure(void)
+{
+	static uint8_t col[W * H * 4], mv[80 * 60];
+	static uint16_t dz[W * H];
+	glBindImageTexture(1, t_out, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+	glProgramUniform1i(p_cmap, glGetUniformLocation(p_cmap, "u_occl"), g_occl);
+	glProgramUniform1i(p_cmap, glGetUniformLocation(p_cmap, "u_pull"), g_pull);
+	glProgramUniform1f(p_cmap, glGetUniformLocation(p_cmap, "u_uvt"), g_uvt);
+	glUseProgram(p_cmap);
+	glDispatchCompute(W / 16, H / 16, 1);
+	glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+	glGetTextureImage(t_out, 0, GL_RGBA, GL_UNSIGNED_BYTE, sizeof col, col);
+	glGetTextureImage(t_depth, 0, GL_RED_INTEGER, GL_UNSIGNED_SHORT, sizeof dz, dz);
+	glGetTextureImage(t_dmov, 0, GL_RED, GL_UNSIGNED_BYTE, sizeof mv, mv);
+	for (int i = 0; i < 80 * 60; i++) { g_sp.moving_cells += mv[i] > 200; g_sp.flow_cells += mv[i] > 127 && mv[i] <= 200; }
+	static const int DX[4] = {1, -1, 0, 0}, DY[4] = {0, 0, 1, -1};
+	for (int y = 20; y < H - 20; y++)
+		for (int x = 20; x < W - 20; x++) {
+			const int zf = dz[y * W + x];
+			if (!zf || zf >= 10000) continue;
+			for (int d = 0; d < 4; d++) {
+				const int dx = DX[d], dy = DY[d];
+				int b = -1, zb = 0;
+				for (int s = 1; s <= 12; s++) { /* the first valid pixel along the direction */
+					const int zz = dz[(y + s * dy) * W + x + s * dx];
+					if (!zz || zz >= 10000) continue;
+					if ((float)zz > (float)zf + fmaxf(150.0f, 0.1f * (float)zf)) { b = s; zb = zz; }
+					break;
+				}
+				if (b < 0) continue;
+				const int fi = (y - 6 * dy) * W + x - 6 * dx, bi = (y + (b + 6) * dy) * W + x + (b + 6) * dx;
+				if (!dz[fi] || abs(dz[fi] - zf) > 100 || !dz[bi] || (float)abs(dz[bi] - zb) > 0.1f * (float)zb || !col[4 * fi + 3] || !col[4 * bi + 3]) continue;
+				const uint8_t *If = col + 4 * fi, *Ib = col + 4 * bi;
+				if (l1rgb(If, Ib) < 90) continue;
+				for (int k = 0; k < 3; k++) {
+					const int f = (y - k * dy) * W + x - k * dx, g = (y + (b + k) * dy) * W + x + (b + k) * dx;
+					if (dz[f] && abs(dz[f] - zf) <= 100 && col[4 * f + 3]) { const int bad = l1rgb(col + 4 * f, Ib) < l1rgb(col + 4 * f, If), wf = col[4 * f + 3] < 200; g_sp.tested[0][k]++; g_sp.bad[0][k] += bad; g_sp.wt[0] += wf; g_sp.wb[0] += wf && bad; }
+					if (dz[g] && (float)abs(dz[g] - zb) <= 0.1f * (float)zb && col[4 * g + 3]) { const int bad = l1rgb(col + 4 * g, If) < l1rgb(col + 4 * g, Ib), wf = col[4 * g + 3] < 200; g_sp.tested[1][k]++; g_sp.bad[1][k] += bad; g_sp.wt[1] += wf; g_sp.wb[1] += wf && bad; }
+				}
+			}
+		}
+	g_sp.frames++;
+}
+
+static void splat_report(void)
+{
+	printf("splat-stats: %lu frames, still depth %s, edge pull %s, uv time %s, occl %d; moving cells %.1f a frame\n", g_sp.frames, g_still && g_dfilter ? "on" : "off",
+	       g_pull ? "on" : "off", g_uvc ? "on" : "off", g_occl, g_sp.frames ? (double)g_sp.moving_cells / (double)g_sp.frames : 0.0);
+	printf("splat-stats: cells with flow evidence only %.1f a frame; webcam-filled among the tested: near %lu (%.1f %% bad), far %lu (%.1f %% bad)\n", g_sp.frames ? (double)g_sp.flow_cells / (double)g_sp.frames : 0.0,
+	       g_sp.wt[0], g_sp.wt[0] ? 100.0 * (double)g_sp.wb[0] / (double)g_sp.wt[0] : 0.0, g_sp.wt[1], g_sp.wt[1] ? 100.0 * (double)g_sp.wb[1] / (double)g_sp.wt[1] : 0.0);
+	for (int s = 0; s < 2; s++) {
+		printf("splat-stats: %s surface in the %s one's colours:", s ? "far " : "near", s ? "near" : "far");
+		for (int k = 0; k < 3; k++) printf("  %d px from the edge %5.2f %% of %lu", k, g_sp.tested[s][k] ? 100.0 * (double)g_sp.bad[s][k] / (double)g_sp.tested[s][k] : 0.0, g_sp.tested[s][k]);
+		printf("\n");
+	}
+}
 /* calibration uniforms into every program that projects into the webcam */
 static void apply_calib(void)
 {
-	GLuint progs[6] = {p_mesh[0], p_mesh[1], p_pmap, p_wz, p_syn, p_gn};
-	for (int i = 0; i < 6; i++) {
+	GLuint progs[7] = {p_mesh[0], p_mesh[1], p_pmap, p_wz, p_syn, p_gn, p_cmap};
+	for (int i = 0; i < 7; i++) {
 		GLuint p = progs[i];
 		glProgramUniform1f(p, glGetUniformLocation(p, "u_k"), g_k);
 		glProgramUniform1i(p, glGetUniformLocation(p, "u_wcal"), g_cal.ok);
@@ -1344,13 +1544,15 @@ static void fg_new_frame(fgcam *f, double t_cap, double now)
 }
 
 static GLuint g_q_fg;
-static void fg_generate(GLuint older, GLuint newer, GLuint mid, GLuint out, float sign)
+static int g_fgfb; /* --fg-fallback: the generated picture falls back where its two halves disagree. Off: measured worse (fg-test, 2 runs: moving PSNR 25.04 / 24.29 dB against 25.93 / 25.24 for the plain mean) */
+static void fg_generate(GLuint older, GLuint newer, GLuint mid, GLuint out, float sign, int fb)
 {
 	glBindTextureUnit(13, older);
 	glBindTextureUnit(14, newer);
 	glBindTextureUnit(15, mid);
 	glBindImageTexture(1, out, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
 	glProgramUniform1f(p_fg, 0, sign);
+	glProgramUniform1i(p_fg, 1, fb);
 	glUseProgram(p_fg);
 	glDispatchCompute(W / 16, H / 16, 1);
 	glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT | GL_PIXEL_BUFFER_BARRIER_BIT);
@@ -1362,7 +1564,7 @@ static void fg_field(fgcam *f, const uint32_t seq[2])
 	if (f->gen && g_fg && seq[1] != f->seq) f->late++;
 	if (!f->gen || !g_fg || f->phase != 0 || seq[1] != f->seq || seq[0] + 1 != seq[1]) return;
 	glTextureSubImage2D(f->mid, 0, 0, 0, 80, 60, GL_RG, GL_FLOAT, g_rawbuf);
-	fg_generate(f->prev, f->cur, f->mid, f->gen, 1.0f);
+	fg_generate(f->prev, f->cur, f->mid, f->gen, 1.0f, g_fgfb);
 	f->phase = 1;
 	f->made++;
 }
@@ -1406,12 +1608,12 @@ static GLuint fg_display(fgcam *f, double now)
 #define FGT_RING 8
 static fsrcam *g_fst;
 static GLuint t_ta, t_tb, t_tg, t_tmid;
-static uint8_t *g_tring, *g_tgen[2];
+static uint8_t *g_tring, *g_tgen[3];
 static uint32_t g_tidx[FGT_RING], g_tmap[16], g_tpush;
 static double g_tt[FGT_RING], g_tsecs, g_t0_test;
 static float g_trawbuf[80 * 60 * 2], g_tfsbuf[80 * 60 * 4];
 static struct {
-	double sse[4][2], ns_gpu;
+	double sse[5][2], ns_gpu;
 	unsigned long n[2];
 	unsigned triples, rejected, motion_triples, wins, wins_rev, gpu_n;
 } g_ft;
@@ -1423,7 +1625,8 @@ static int fgt_setup(void)
 	g_tring = malloc((size_t)FGT_RING * W * H * 3);
 	g_tgen[0] = malloc((size_t)W * H * 3);
 	g_tgen[1] = malloc((size_t)W * H * 3);
-	if (!g_fst || !g_tring || !g_tgen[0] || !g_tgen[1]) return -1;
+	g_tgen[2] = malloc((size_t)W * H * 3);
+	if (!g_fst || !g_tring || !g_tgen[0] || !g_tgen[1] || !g_tgen[2]) return -1;
 	for (int i = 0; i < FGT_RING; i++) g_tidx[i] = UINT32_MAX;
 	t_ta = tex2d(GL_RGB8, W, H, 1);
 	t_tb = tex2d(GL_RGB8, W, H, 1);
@@ -1456,9 +1659,9 @@ static void fgt_poll(void)
 	glTextureSubImage2D(t_ta, 0, 0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, A);
 	glTextureSubImage2D(t_tb, 0, 0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, B);
 	glTextureSubImage2D(t_tmid, 0, 0, 0, 80, 60, GL_RG, GL_FLOAT, g_trawbuf);
-	for (int s = 0; s < 2; s++) {
+	for (int s = 0; s < 3; s++) {
 		if (!s) glBeginQuery(GL_TIME_ELAPSED, g_q_fg);
-		fg_generate(t_ta, t_tb, t_tmid, t_tg, s ? -1.0f : 1.0f);
+		fg_generate(t_ta, t_tb, t_tmid, t_tg, s == 1 ? -1.0f : 1.0f, s == 2); /* 0 the generated picture, 1 the sign control, 2 with the fallback */
 		if (!s) {
 			glEndQuery(GL_TIME_ELAPSED);
 			GLuint64 ns = 0;
@@ -1468,7 +1671,7 @@ static void fgt_poll(void)
 		}
 		glGetTextureImage(t_tg, 0, GL_RGB, GL_UNSIGNED_BYTE, W * H * 3, g_tgen[s]);
 	}
-	double sse[4][2] = {{0}};
+	double sse[5][2] = {{0}};
 	unsigned long nm = 0;
 	for (int y = 8; y < H - 8; y++)
 		for (int x = 8; x < W - 8; x++) {
@@ -1476,8 +1679,8 @@ static void fgt_poll(void)
 			int mot = 0;
 			for (int c = 0; c < 3; c++) mot |= abs((int)A[o + c] - (int)B[o + c]) > 24;
 			for (int c = 0; c < 3; c++) {
-				const int truth = M[o + c], p[4] = {A[o + c], (A[o + c] + B[o + c] + 1) >> 1, g_tgen[0][o + c], g_tgen[1][o + c]};
-				for (int q = 0; q < 4; q++) {
+				const int truth = M[o + c], p[5] = {A[o + c], (A[o + c] + B[o + c] + 1) >> 1, g_tgen[0][o + c], g_tgen[1][o + c], g_tgen[2][o + c]};
+				for (int q = 0; q < 5; q++) {
 					const double d = (double)(p[q] - truth);
 					sse[q][0] += d * d;
 					if (mot) sse[q][1] += d * d;
@@ -1485,7 +1688,7 @@ static void fgt_poll(void)
 			}
 			nm += (unsigned long)mot;
 		}
-	for (int q = 0; q < 4; q++) { g_ft.sse[q][0] += sse[q][0]; g_ft.sse[q][1] += sse[q][1]; }
+	for (int q = 0; q < 5; q++) { g_ft.sse[q][0] += sse[q][0]; g_ft.sse[q][1] += sse[q][1]; }
 	g_ft.n[0] += 3ul * (unsigned long)(W - 16) * (H - 16);
 	g_ft.n[1] += 3ul * nm;
 	g_ft.triples++;
@@ -1500,11 +1703,11 @@ static double fgt_psnr(int q, int m) { return g_ft.sse[q][m] > 0 ? 10.0 * log10(
 
 static void fgt_report(void)
 {
-	static const char *const NAME[4] = {"repeat k-1", "average", "generated", "sign reversed"};
+	static const char *const NAME[5] = {"repeat k-1", "average", "generated", "sign reversed", "generated + fallback"};
 	printf("fg-test: %u triples measured, %u rejected (uneven timing or a skipped push), %u with >= 1000 moving pixels, "
 	       "moving pixels %.2f %% of all\n", g_ft.triples, g_ft.rejected, g_ft.motion_triples,
 	       g_ft.n[0] ? 100.0 * (double)g_ft.n[1] / (double)g_ft.n[0] : 0.0);
-	for (int q = 0; q < 4; q++) printf("fg-test: %-14s PSNR all %6.2f dB   moving %6.2f dB\n", NAME[q], fgt_psnr(q, 0), fgt_psnr(q, 1));
+	for (int q = 0; q < 5; q++) printf("fg-test: %-22s PSNR all %6.2f dB   moving %6.2f dB\n", NAME[q], fgt_psnr(q, 0), fgt_psnr(q, 1));
 	printf("fg-test: generated beats average in %u of %u moving triples, beats sign reversed in %u; generation GPU %.4f ms (mean of %u)\n",
 	       g_ft.wins, g_ft.motion_triples, g_ft.wins_rev, g_ft.gpu_n ? g_ft.ns_gpu * 1e-6 / g_ft.gpu_n : 0.0, g_ft.gpu_n);
 }
@@ -2252,13 +2455,15 @@ static int al_bg_prepare(int post)
 	return 0;
 }
 
+static float g_bg_zmin = 1200.0f; /* points from this depth on */
+static int g_bg_part = -1, g_obj_noface; /* -1 every point, 0 or 1: one colour of a 16 px checkerboard; the objective without the face term */
 static double al_bg_ncc(const double R[9], const double t[3], int *cnt)
 {
 	double n = 0, sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0, p[2];
 	for (int y = 2; y < H - 2; y += 2)
 		for (int x = 2; x < W - 2; x += 2) {
 			const float *P = g_bgpm + 4 * ((size_t)y * W + x);
-			if (P[3] < 0.5f || P[2] < 1200.0f) continue;
+			if (P[3] < 0.5f || P[2] < g_bg_zmin || (g_bg_part >= 0 && (((x >> 4) + (y >> 4)) & 1) != g_bg_part)) continue;
 			const double X[3] = {P[0], P[1], P[2]};
 			al_project(R, t, X, p);
 			if (p[0] < 1 || p[1] < 1 || p[0] >= W - 2 || p[1] >= H - 2) continue;
@@ -2315,7 +2520,7 @@ static double al_objective(const double R[9], const double t[3], double face_bes
 	int c1, c2;
 	*fm = al_median(R, t, 0, &c1);
 	*nc = al_bg_ncc(R, t, &c2);
-	return -*nc + (*fm > face_best + 1.5 ? 0.05 * (*fm - face_best - 1.5) : 0.0);
+	return -*nc + (!g_obj_noface && *fm > face_best + 1.5 ? 0.05 * (*fm - face_best - 1.5) : 0.0);
 }
 
 static void al_pose_at(const double Rb[9], const double tb[3], const double x[6], double zf, double R[9], double t[3])
@@ -2375,6 +2580,83 @@ static void al_nm(double R[9], double t[3], double zf, double face_best, double 
 	int b = 0;
 	for (int v = 1; v < 7; v++) if (f[v] < f[b]) b = v;
 	al_pose_at(Rb, tb, s[b], zf, R, t);
+}
+
+/* ---- the pose from the still scene alone (no face needed): the photo-consistency of the two colour cameras through
+ * the Kinect's depth, as the VisionTrack depth map compares views (exposures differ, so not grey levels: there a
+ * 9 x 9 normalisation, here the gradient magnitude's correlation, which alscape showed peaks sharply where grey
+ * levels do not). Every point with depth takes part, from 0.3 m: near and far points together fix rotation and
+ * translation apart (the parallax between them), which the face at one depth could not.
+ * Search: the pose in use turned by a whole-picture shift, +-96 px in steps of 8 then +-8 in steps of 2 (wide
+ * gradients, 6 blurs); then Nelder-Mead over the six parameters, wide then narrow gradients. Fitted on one colour
+ * of a 16 px checkerboard of the picture, judged on the other: applied when the correlation there rises by 0.05. */
+static void al_shift_pose(const double R[9], const double t[3], double du, double dv, double Ro[9], double to[3])
+{
+	const double w[3] = {-dv / g_cal.K[1], du / g_cal.K[0], 0.0};
+	double E[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+	al_rotate(E, w);
+	memcpy(Ro, R, sizeof(double) * 9);
+	al_rotate(Ro, w);
+	for (int i = 0; i < 3; i++) to[i] = E[3 * i] * t[0] + E[3 * i + 1] * t[1] + E[3 * i + 2] * t[2];
+}
+
+static int g_al_static_done;
+static double now_s(void);
+static void al_static(void)
+{
+	double R0[9], t0[3], R[9], t[3], Rs[9], ts[3];
+	int n;
+	for (int i = 0; i < 9; i++) R0[i] = g_cal.R[i];
+	for (int i = 0; i < 3; i++) t0[i] = g_cal.t[i];
+	const double t_start = now_s();
+	g_bg_zmin = 300.0f;
+	g_obj_noface = 1;
+	if (al_bg_prepare(2)) { g_bg_zmin = 1200.0f; g_obj_noface = 0; return; }
+	g_bg_part = 1;
+	const double test_old = al_bg_ncc(R0, t0, &n);
+	g_bg_part = 0;
+	const double train_old = al_bg_ncc(R0, t0, &n);
+	al_bg_prepare(6);
+	double best = -2, bu = 0, bv = 0;
+	for (int pass = 0; pass < 2; pass++) {
+		const double cu = bu, cv = bv, step = pass ? 2.0 : 8.0, span = pass ? 8.0 : 96.0;
+		for (double dv = -span; dv <= span; dv += step)
+			for (double du = -span; du <= span; du += step) {
+				al_shift_pose(R0, t0, cu + du, cv + dv, Rs, ts);
+				const double s = al_bg_ncc(Rs, ts, &n);
+				if (s > best) { best = s; bu = cu + du; bv = cv + dv; }
+			}
+	}
+	al_shift_pose(R0, t0, bu, bv, R, t);
+	double zf = 0;
+	int nz = 0;
+	for (int i = 0; i < W * H; i += 7)
+		if (g_bgpm[4 * i + 3] > 0.5f && g_bgpm[4 * i + 2] >= 300.0f) { zf += g_bgpm[4 * i + 2]; nz++; }
+	zf = nz ? zf / nz : 1500.0;
+	al_nm(R, t, zf, 0.0, 20.0);
+	al_bg_prepare(2);
+	al_nm(R, t, zf, 0.0, 5.0);
+	const double train_new = al_bg_ncc(R, t, &n);
+	g_bg_part = 1;
+	int ntest;
+	const double test_new = al_bg_ncc(R, t, &ntest);
+	g_bg_part = -1;
+	g_bg_zmin = 1200.0f;
+	g_obj_noface = 0;
+	double tr = 0;
+	for (int i = 0; i < 3; i++)
+		for (int k = 0; k < 3; k++) tr += R[3 * i + k] * R0[3 * i + k];
+	const double drot = acos(fmax(-1.0, fmin(1.0, 0.5 * (tr - 1.0)))) * 57.29577951308232;
+	const double dt = sqrt((t[0] - t0[0]) * (t[0] - t0[0]) + (t[1] - t0[1]) * (t[1] - t0[1]) + (t[2] - t0[2]) * (t[2] - t0[2]));
+	const int ok = ntest >= 2000 && test_new >= test_old + 0.05;
+	printf("align: still scene: gradient correlation, fitted half %.3f -> %.3f, held-out half %.3f -> %.3f (%d points); whole-picture shift found (%+.0f, %+.0f) px; "
+	       "change %.2f deg %.1f mm; %.0f ms: %s\n", train_old, train_new, test_old, test_new, ntest, bu, bv, drot, dt, 1e3 * (now_s() - t_start), ok ? "APPLIED" : "kept the pose in use");
+	g_al_static_done = 1;
+	if (!ok) return;
+	for (int i = 0; i < 9; i++) g_cal.R[i] = (float)R[i];
+	for (int i = 0; i < 3; i++) g_cal.t[i] = (float)t[i];
+	apply_calib();
+	g_al.applied++;
 }
 static void al_solve(void)
 {
@@ -2605,6 +2887,8 @@ static void draw_mesh(int m, const mat4 *mvp)
 	glProgramUniform1f(p_mesh[m], loc_cull[m], g_cull);
 	glProgramUniform1i(p_mesh[m], loc_occl[m], g_occl);
 	glProgramUniform1f(p_mesh[m], loc_tshift[m], g_tshift);
+	glProgramUniform1i(p_mesh[m], glGetUniformLocation(p_mesh[m], "u_pull"), g_pull);
+	glProgramUniform1f(p_mesh[m], glGetUniformLocation(p_mesh[m], "u_uvt"), g_uvt);
 	glProgramUniformMatrix3fv(p_mesh[m], loc_rcam[m], 1, GL_TRUE, g_room.Rnow);
 	glUseProgram(p_mesh[m]);
 	glBindVertexArray(vao[m]);
@@ -2691,6 +2975,7 @@ static void on_key(GLFWwindow *w, int key, int sc, int action, int mods)
 	case GLFW_KEY_V: g_arrows ^= 1; break;
 	case GLFW_KEY_G: if (p_fg) g_fg ^= 1; break;
 	case GLFW_KEY_T: g_geo ^= 1; break;
+	case GLFW_KEY_A: g_al_static_done = 0; break; /* the still-scene alignment again */
 	case GLFW_KEY_F: g_dfilter ^= 1; break;
 	case GLFW_KEY_L: if (g_flock) g_lock ^= 1; break;
 	case GLFW_KEY_K:
@@ -2776,6 +3061,73 @@ static int wait_first_frames(GLFWwindow *win, const uint8_t **d, const uint8_t *
 }
 
 /* ==== selftest ================================================================================== */
+
+/* ==== depth filter test on made depth (--ghost-test): the real passes, on the GPU, with a known truth ==========
+ * A: a near square (1 m, 120 x 180 px) crosses a far plane (2.5 m) at 8 px a frame, with the 6 px band of
+ *    invalid depth the Kinect leaves beside every near thing. A ghost: a pixel with depth where this frame has
+ *    none and nothing to interpolate (the two sides differ): something left behind. Counted per frame.
+ * B: a still slanted plane with +-1 depth step of noise and 5 % of its pixels dropping out each frame: the error
+ *    left after the filter, and how much of the plane has depth.
+ * Each for the old filter (blend 0.3, 2 frame hold) and the still pictures. Exit status: ghosts of the new one. */
+static int ghost_test(void)
+{
+	uint16_t *raw = malloc(sizeof(uint16_t) * W * H), *out = malloc(sizeof(uint16_t) * W * H);
+	static const float zero[4] = {0, 0, 0, 0};
+	unsigned long ghosts[2] = {0, 0};
+	double rms[2] = {0, 0}, cover[2] = {0, 0}, rawrms = 0;
+	if (!raw || !out) return 99;
+	g_dfilter = 1;
+	for (int mode = 0; mode < 2; mode++) {
+		g_still = mode;
+		glClearTexImage(t_dtemp, 0, GL_RGBA, GL_FLOAT, zero);
+		for (int k = 0; k < 40; k++) {
+			const int x0 = 60 + 8 * k;
+			for (int y = 0; y < H; y++)
+				for (int x = 0; x < W; x++) {
+					const int in_rows = y >= 150 && y < 330;
+					raw[y * W + x] = in_rows && x >= x0 && x < x0 + 120 ? 1000 : in_rows && x >= x0 - 6 && x < x0 ? 0 : 2500;
+				}
+			upload_depth((const uint8_t *)raw);
+			glGetTextureImage(t_depth, 0, GL_RED_INTEGER, GL_UNSIGNED_SHORT, (GLsizei)(sizeof(uint16_t) * W * H), out);
+			if (k < 5) continue;
+			for (int i = 0; i < W * H; i++) ghosts[mode] += raw[i] == 0 && out[i] != 0;
+		}
+		glClearTexImage(t_dtemp, 0, GL_RGBA, GL_FLOAT, zero);
+		uint32_t s = 12345u;
+		double se = 0, sr = 0;
+		unsigned long n = 0, nr = 0, have = 0, total = 0;
+		for (int k = 0; k < 60; k++) {
+			for (int y = 0; y < H; y++)
+				for (int x = 0; x < W; x++) {
+					const double truth = 1500.0 + 1.5 * x, step = truth * truth / 348000.0;
+					s = s * 1664525u + 1013904223u;
+					const int drop = (s >> 8) % 100u < 5u;
+					s = s * 1664525u + 1013904223u;
+					const double nz = (((double)(s >> 8) / 16777216.0) * 2.0 - 1.0) * step;
+					raw[y * W + x] = drop ? 0 : (uint16_t)lrint(truth + nz);
+				}
+			upload_depth((const uint8_t *)raw);
+			if (k < 30) continue;
+			glGetTextureImage(t_depth, 0, GL_RED_INTEGER, GL_UNSIGNED_SHORT, (GLsizei)(sizeof(uint16_t) * W * H), out);
+			for (int y = 8; y < H - 8; y++)
+				for (int x = 8; x < W - 8; x++) {
+					const double truth = 1500.0 + 1.5 * x, step = truth * truth / 348000.0;
+					total++;
+					if (out[y * W + x]) { const double e = ((double)out[y * W + x] - truth) / step; se += e * e; n++; have++; }
+					if (raw[y * W + x]) { const double e = ((double)raw[y * W + x] - truth) / step; sr += e * e; nr++; }
+				}
+		}
+		rms[mode] = n ? sqrt(se / (double)n) : 0;
+		cover[mode] = total ? 100.0 * (double)have / (double)total : 0;
+		rawrms = nr ? sqrt(sr / (double)nr) : 0;
+	}
+	printf("ghost-test A (a near square crossing at 8 px a frame, 35 frames): ghost pixels a frame: old filter %.1f, still pictures %.1f\n", (double)ghosts[0] / 35.0, (double)ghosts[1] / 35.0);
+	printf("ghost-test B (a still plane, noise +-1 depth step, 5 %% drop-outs): error in depth steps (rms): raw %.3f, old filter %.3f, still pictures %.3f; "
+	       "pixels with depth: old %.2f %%, still pictures %.2f %%\n", rawrms, rms[0], rms[1], cover[0], cover[1]);
+	free(raw);
+	free(out);
+	return ghosts[1] > 0;
+}
 static int selftest(GLFWwindow *win, const uint16_t *depth, const uint8_t *rgb, const freenect_registration *reg)
 {
 	int fails = 0;
@@ -2872,7 +3224,7 @@ static int selftest(GLFWwindow *win, const uint16_t *depth, const uint8_t *rgb, 
 /* ==== main ====================================================================================== */
 int main(int argc, char **argv)
 {
-	int do_selftest = 0, bench = 0;
+	int do_selftest = 0, bench = 0, do_ghost = 0;
 	const char *webcam_dev = NULL, *dump_dir = NULL, *calib_dir = NULL, *calib_file = NULL, *track_dir = NULL, *lock_dump = NULL;
 	double track_secs = 25.0, face_secs = 30.0;
 	const char *face_dir = NULL, *face_model = NULL;
@@ -2880,6 +3232,7 @@ int main(int argc, char **argv)
 	double fg_test = 0; /* --fg-test seconds */
 	double face_stats = 0, g_t0_face = 0; /* --face-stats seconds, from the first face */
 	const char *align_dump = NULL; /* --dump-align DIR */
+	int splat_n = 0; /* --splat-stats frames */
 	float view_yaw = 0.0f, view_pitch = 0.0f;
 	char face_model_default[512];
 	snprintf(face_model_default, sizeof face_model_default, "%s/kinect360/models/face_detection_yunet_2023mar.onnx", getenv("HOME") ? getenv("HOME") : ".");
@@ -2893,6 +3246,7 @@ int main(int argc, char **argv)
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--dump-shaders") && i + 1 < argc) return dump_shaders(argv[++i]);
 		else if (!strcmp(argv[i], "--selftest")) do_selftest = 1;
+		else if (!strcmp(argv[i], "--ghost-test")) do_ghost = 1;
 		else if (!strcmp(argv[i], "--bench") && i + 1 < argc) bench = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--method") && i + 1 < argc) g_method = argv[++i][0] == 'b';
 		else if (!strcmp(argv[i], "--webcam") && i + 1 < argc) webcam_dev = argv[++i];
@@ -2905,8 +3259,13 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--flow-source") && i + 1 < argc) g_fsrc = strcmp(argv[++i], "lk") != 0;
 		else if (!strcmp(argv[i], "--fsr-vec") && i + 1 < argc) { const char *m = argv[++i]; fsr_vector_mode(!strcmp(m, "ema") ? 0 : !strcmp(m, "lk") ? 1 : !strcmp(m, "lk-all") ? 2 : !strcmp(m, "gen") ? 3 : !strcmp(m, "lk-ema") ? 4 : !strcmp(m, "gen-ema") ? 5 : 6); }
 		else if (!strcmp(argv[i], "--no-fg")) g_fg = 0;
+		else if (!strcmp(argv[i], "--fg-fallback")) g_fgfb = 1;
 		else if (!strcmp(argv[i], "--no-geo-time")) g_geo = 0;
 		else if (!strcmp(argv[i], "--raw-vel")) g_vsmooth = 0;
+		else if (!strcmp(argv[i], "--no-still-depth")) g_still = 0;
+		else if (!strcmp(argv[i], "--no-edge-pull")) g_pull = 0;
+		else if (!strcmp(argv[i], "--no-uv-time")) g_uvc = 0;
+		else if (!strcmp(argv[i], "--splat-stats") && i + 1 < argc) splat_n = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--no-face-track")) g_facetrack = 0;
 		else if (!strcmp(argv[i], "--no-align")) g_align = 0;
 		else if (!strcmp(argv[i], "--dump-align") && i + 1 < argc) align_dump = argv[++i];
@@ -2960,6 +3319,7 @@ int main(int argc, char **argv)
 		g_fsk = fsr_open(W, H, ck, 4);
 		if (g_cam) g_fsw = fsr_open(W, H, cw, 4);
 		t_fsk = tex2d(GL_RGBA32F, 80, 60, 1);
+		glBindTextureUnit(17, t_fsk); /* the Kinect colour's vectors: the depth's motion evidence and the colour lookup's time shift */
 		t_fsw = tex2d(GL_RGBA32F, 80, 60, 1);
 		if (!g_fsk) { fprintf(stderr, "kinect3d: FSR flow engine did not start: GPU LK flow, no frame generation\n"); g_fsrc = 0; g_fg = 0; }
 		else printf("kinect3d: FSR 3 optical flow on the Kinect%s, 4 threads each: velocity field from %s, frame generation %s\n",
@@ -3017,6 +3377,7 @@ int main(int argc, char **argv)
 	       1.0 / (double)g_k, (double)reg.zero_plane_info.dcmos_rcmos_dist, (unsigned)reg.reg_pad_info.start_lines);
 	upload_rgb(v0);
 	g_dfilter = !do_selftest; /* the selftest compares against libfreenect on the raw depth */
+	if (do_selftest) g_pull = g_uvc = 0; /* and on the registration as libfreenect has it */
 	upload_depth(d0);
 	{
 		freenect_raw_tilt_state *ts;
@@ -3025,6 +3386,13 @@ int main(int argc, char **argv)
 		tilt_deg = (int)lround(freenect_get_tilt_degs(ts));
 	}
 
+	if (do_ghost) {
+		int f = ghost_test();
+		freenect_destroy_registration(&reg);
+		glfwTerminate();
+		kinect_close();
+		return f;
+	}
 	if (do_selftest) {
 		int f = selftest(win, (const uint16_t *)d0, v0, &reg);
 		printf("selftest: %d FAIL\n", f);
@@ -3141,6 +3509,7 @@ int main(int argc, char **argv)
 				if (!g_t0_face && g_fo[c].faces) g_t0_face = now_s();
 			}
 		align_step();
+		if (g_align && g_cal.ok && !g_al_static_done && g_lastk && g_lastw && nfk > 90 && nfw > 90) al_static();
 		if (align_dump && g_lastk && g_lastw && nfk > 150 && nfw > 150) { /* --dump-align: one frame of each camera, the point map, the pose in use */
 			char p[1024];
 			int bad = al_bg_prepare(2);
@@ -3325,6 +3694,8 @@ int main(int argc, char **argv)
 			const double tcol = g_fgk.gen && g_fgk.t_cap_prev > 0 ? (g_fgk.show == 0 ? g_fgk.t_cap_prev : g_fgk.show == 1 ? 0.5 * (g_fgk.t_cap_prev + g_fgk.t_cap_last) : g_fgk.t_cap_last) : g_t_rgb;
 			const double ts = g_geo && g_t_depth > 0 && tcol > 0 && sf_frames ? tcol - g_t_depth : 0.0;
 			g_tshift = (float)(ts > 0.05 ? 0.05 : ts < -0.05 ? -0.05 : ts);
+			const double uvt = g_uvc && g_t_depth > 0 && tcol > 0 ? (g_t_depth - tcol) / (g_fgk.period > 0 ? g_fgk.period : 1.0 / 30.0) : 0.0;
+			g_uvt = (float)(uvt > 1.5 ? 1.5 : uvt < -1.5 ? -1.5 : uvt); /* the colour lookup follows the surface to the picture's instant */
 			if (g_tshift != 0.0f) { g_tshift_sum += fabs(g_tshift); g_tshift_n++; }
 			static unsigned geo_depth;
 			static float geo_shift;
@@ -3334,6 +3705,10 @@ int main(int argc, char **argv)
 		glBeginQuery(GL_TIME_ELAPSED, q[qi]);
 		draw_mesh(m, &mvp);
 		glEndQuery(GL_TIME_ELAPSED);
+		if (splat_n > 0 && d && sf_frames > 30) { /* with the shown pictures bound: what the mesh was just drawn with */
+			splat_measure();
+			if (g_sp.frames >= (unsigned long)splat_n) glfwSetWindowShouldClose(win, 1);
+		}
 		if (g_arrows && sf_frames) draw_arrows(&mvp);
 		if (g_pip) draw_pip(fbw, fbh);
 		glBindTextureUnit(4, t_rgb); /* the analysis passes read the real frames */
@@ -3476,6 +3851,7 @@ int main(int argc, char **argv)
 		vtf_close(g_vtf[c]);
 	}
 	if (g_vtf[0]) printf("kinect3d: face in the room: %u points, %u without depth under the box\n", g_facep.points, g_facep.misses);
+	if (g_sp.frames) splat_report();
 	if (g_fst) fgt_report();
 	if (g_tshift_n) printf("kinect3d: geometry at the colour's instant: mean |shift| %.2f ms over %u draws\n", 1e3 * g_tshift_sum / g_tshift_n, g_tshift_n);
 	if (g_fgk.gen) printf("kinect3d: frame generation: Kinect %u generated, %u images shown, %u fields late, %u periods without one; webcam %u, %u, %u, %u\n", g_fgk.made, g_fgk.shown, g_fgk.late, g_fgk.nofield, g_fgw.made, g_fgw.shown, g_fgw.late, g_fgw.nofield);
