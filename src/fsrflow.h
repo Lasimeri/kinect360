@@ -18,6 +18,10 @@ int fsr_poll(fsrcam *c, float *out, float *raw, uint32_t seq[2]);
  * replaced before the engine took it is never a member, so seq[1] - seq[0] can exceed 1) */
 /* block until a field is ready or CLOCK_MONOTONIC reaches deadline_s; 1 when one is ready (fsr_poll takes it) */
 int fsr_wait(fsrcam *c, double deadline_s);
+/* the mid-instant field alone, as soon as the flow has it (before the vectors are refined): what frame generation reads.
+ * fsr_wait_mid blocks like fsr_wait; fsr_poll_mid: 1 with raw (w/8) x (h/8) x 2 floats and the field's push numbers */
+int fsr_wait_mid(fsrcam *c, double deadline_s);
+int fsr_poll_mid(fsrcam *c, float *raw, uint32_t seq[2]);
 void fsr_stats(const fsrcam *c, unsigned *fields, unsigned *skipped, unsigned *scene_changes, double *engine_ms);
 /* 0 EMA over whole pixels; 1 VisionTrack's LK refinement on moving blocks; 2 on every block; 3 through the generated frame;
  * 4 = 2 + EMA; 5 = 3 + EMA; 6 = 2 smoothed over 3 x 3 agreeing blocks and an alpha-beta filter over time (default) */

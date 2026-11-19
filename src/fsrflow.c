@@ -42,7 +42,9 @@ struct fsrcam {
 	void *mem;
 	int w, h, bw, bh;
 	uint8_t *luma[2]; /* [0] pending, written by fsr_push; [1] work, read by the worker */
-	struct fg_vec *res;
+	struct fg_vec *res, *res2; /* the mid-instant field: published at once (fsr_poll_mid), and the copy that goes with the refined vectors (fsr_poll) */
+	int mid_fresh, mid_made;
+	uint32_t mid_seq[2];
 	uint8_t *older;   /* the last frame the engine took: what refine_block steps against */
 	float *ref;       /* the newer-frame field (fil[0]), refined: (w/8) x (h/8) x 2 */
 	float *refw;      /* the worker's copy, swapped into ref under the lock */
@@ -178,6 +180,15 @@ static void *worker(void *p)
 		const int made = flow_make(&c->f);
 		clock_gettime(CLOCK_MONOTONIC, &b);
 		struct timespec b2;
+		/* the mid-instant field first: frame generation must not wait for the vectors' refinement (2.9-9.7 ms a field, measured live) */
+		pthread_mutex_lock(&c->lock);
+		if (made == 1) memcpy(c->res, c->f.fg.mid.v, vec_bytes);
+		c->mid_made = made;
+		c->mid_seq[0] = c->done_seq;
+		c->mid_seq[1] = c->work_seq;
+		c->mid_fresh = 1;
+		pthread_cond_broadcast(&c->done);
+		pthread_mutex_unlock(&c->lock);
 		const int via_gen = g_vecmode == 3 || g_vecmode == 5, all_blocks = g_vecmode == 2 || g_vecmode == 4 || g_vecmode == 6;
 		if (made == 1 && via_gen) gen_luma(c->f.fg.mid.v, c->bw, c->bh, c->older, c->luma[1], c->w, c->h, c->gen);
 		if (made == 1) /* VisionTrack's motion vectors from the newer-frame field, before the lock */
@@ -195,7 +206,7 @@ static void *worker(void *p)
 		clock_gettime(CLOCK_MONOTONIC, &b2);
 		const double ref_ms = (double)(b2.tv_sec - b.tv_sec) * 1e3 + (double)(b2.tv_nsec - b.tv_nsec) * 1e-6;
 		pthread_mutex_lock(&c->lock);
-		if (made == 1) { memcpy(c->res, c->f.fg.mid.v, vec_bytes); float *s = c->ref; c->ref = c->refw; c->refw = s; }
+		if (made == 1) { memcpy(c->res2, c->f.fg.mid.v, vec_bytes); float *s = c->ref; c->ref = c->refw; c->refw = s; }
 		c->made = made;
 		c->field_seq[0] = c->done_seq;
 		c->field_seq[1] = c->work_seq;
@@ -225,6 +236,7 @@ void fsr_close(fsrcam *c)
 	free(c->luma[0]);
 	free(c->luma[1]);
 	free(c->res);
+	free(c->res2);
 	free(c->m);
 	free(c->ok);
 	free(c->older);
@@ -252,6 +264,7 @@ fsrcam *fsr_open(int w, int h, const int *cpus, int threads)
 	c->luma[0] = calloc((size_t)w * h, 1);
 	c->luma[1] = calloc((size_t)w * h, 1);
 	c->res = calloc((size_t)c->bw * c->bh, sizeof(struct fg_vec));
+	c->res2 = calloc((size_t)c->bw * c->bh, sizeof(struct fg_vec));
 	c->m = calloc((size_t)c->bw * c->bh * 2, sizeof(float));
 	c->ok = calloc((size_t)c->bw * c->bh, 1);
 	c->older = calloc((size_t)w * h, 1);
@@ -260,7 +273,7 @@ fsrcam *fsr_open(int w, int h, const int *cpus, int threads)
 	c->gen = calloc((size_t)w * h, 1);
 	c->sp = calloc((size_t)c->bw * c->bh * 2, sizeof(float));
 	c->acc = calloc((size_t)c->bw * c->bh * 2, sizeof(float));
-	if (!c->mem || !c->luma[0] || !c->luma[1] || !c->res || !c->m || !c->ok || !c->older || !c->ref || !c->refw || !c->gen || !c->sp || !c->acc) { fsr_close(c); return NULL; }
+	if (!c->mem || !c->luma[0] || !c->luma[1] || !c->res || !c->res2 || !c->m || !c->ok || !c->older || !c->ref || !c->refw || !c->gen || !c->sp || !c->acc) { fsr_close(c); return NULL; }
 	memset(c->mem, 0, fb);
 	c->team = team_create(cpus, threads);
 	if (!c->team || flow_init(&c->f, c->mem, w, h, FLOW_VEC, team_runner, c->team) || c->f.fg.mid.w != c->bw || c->f.fg.mid.h != c->bh || c->f.fg.fil[0].w != c->bw || c->f.fg.fil[0].h != c->bh) {
@@ -322,7 +335,7 @@ int fsr_poll(fsrcam *c, float *out, float *raw, uint32_t seq[2])
 			z = c->sp;
 		}
 		for (int i = 0; i < c->bw * c->bh; i++) {
-			const float mx = c->res[i].x, my = c->res[i].y;
+			const float mx = c->res2[i].x, my = c->res2[i].y;
 			const float vx = g_vecmode ? z[2 * i] : mx, vy = g_vecmode ? z[2 * i + 1] : my;
 			float *m = c->m + 2 * i, *a = c->acc + 2 * i;
 			if (g_vecmode == 6) { /* over time without a lag under steady acceleration: an alpha-beta filter (0.4, 0.1) on the vector and its rate */
@@ -352,18 +365,6 @@ void fsr_stats(const fsrcam *c, unsigned *fields, unsigned *skipped, unsigned *s
 	*engine_ms = c->runs ? c->ms_sum / c->runs : 0.0;
 }
 
-int fsr_wait(fsrcam *c, double deadline_s)
-{
-	struct timespec d;
-	d.tv_sec = (time_t)deadline_s;
-	d.tv_nsec = (long)((deadline_s - (double)d.tv_sec) * 1e9);
-	if (d.tv_nsec >= 1000000000L) { d.tv_sec++; d.tv_nsec -= 1000000000L; }
-	pthread_mutex_lock(&c->lock);
-	while (!c->fresh && pthread_cond_timedwait(&c->done, &c->lock, &d) == 0) {}
-	const int fresh = c->fresh;
-	pthread_mutex_unlock(&c->lock);
-	return fresh;
-}
 
 void fsr_refine_stats(const fsrcam *c, unsigned *refined, unsigned *kept_whole, unsigned *still, double *ms)
 {
@@ -371,4 +372,34 @@ void fsr_refine_stats(const fsrcam *c, unsigned *refined, unsigned *kept_whole, 
 	*kept_whole = c->kept_whole;
 	*still = c->still;
 	*ms = c->runs ? c->ref_ms_sum / c->runs : 0.0;
+}
+
+static int wait_flag(fsrcam *c, const int *flag, double deadline_s)
+{
+	struct timespec d;
+	d.tv_sec = (time_t)deadline_s;
+	d.tv_nsec = (long)((deadline_s - (double)d.tv_sec) * 1e9);
+	if (d.tv_nsec >= 1000000000L) { d.tv_sec++; d.tv_nsec -= 1000000000L; }
+	pthread_mutex_lock(&c->lock);
+	while (!*flag && pthread_cond_timedwait(&c->done, &c->lock, &d) == 0) {}
+	const int fresh = *flag;
+	pthread_mutex_unlock(&c->lock);
+	return fresh;
+}
+
+int fsr_wait(fsrcam *c, double deadline_s) { return wait_flag(c, &c->fresh, deadline_s); }
+int fsr_wait_mid(fsrcam *c, double deadline_s) { return wait_flag(c, &c->mid_fresh, deadline_s); }
+
+int fsr_poll_mid(fsrcam *c, float *raw, uint32_t seq[2])
+{
+	pthread_mutex_lock(&c->lock);
+	const int fresh = c->mid_fresh && c->mid_made == 1;
+	c->mid_fresh = 0;
+	if (fresh) {
+		for (int i = 0; i < c->bw * c->bh; i++) { raw[2 * i] = c->res[i].x; raw[2 * i + 1] = c->res[i].y; }
+		seq[0] = c->mid_seq[0];
+		seq[1] = c->mid_seq[1];
+	}
+	pthread_mutex_unlock(&c->lock);
+	return fresh;
 }

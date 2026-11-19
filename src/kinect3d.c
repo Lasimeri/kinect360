@@ -3126,15 +3126,13 @@ int main(int argc, char **argv)
 			nfw++;
 		}
 		uint32_t fseq[2];
-		if (g_fsk && fsr_poll(g_fsk, g_fsbuf, g_rawbuf, fseq)) {
+		if (g_fsk && fsr_poll_mid(g_fsk, g_rawbuf, fseq)) fg_field(&g_fgk, fseq); /* the mid field: frame generation, as early as it exists */
+		if (g_fsw && fsr_poll_mid(g_fsw, g_rawbuf, fseq)) fg_field(&g_fgw, fseq);
+		if (g_fsk && fsr_poll(g_fsk, g_fsbuf, NULL, NULL)) { /* the refined, smoothed vectors: the velocity field */
 			glTextureSubImage2D(t_fsk, 0, 0, 0, 80, 60, GL_RGBA, GL_FLOAT, g_fsbuf);
-			fg_field(&g_fgk, fseq);
 			nfk_fsr++;
 		}
-		if (g_fsw && fsr_poll(g_fsw, g_fsbuf, g_rawbuf, fseq)) {
-			glTextureSubImage2D(t_fsw, 0, 0, 0, 80, 60, GL_RGBA, GL_FLOAT, g_fsbuf);
-			fg_field(&g_fgw, fseq);
-		}
+		if (g_fsw && fsr_poll(g_fsw, g_fsbuf, NULL, NULL)) glTextureSubImage2D(t_fsw, 0, 0, 0, 80, 60, GL_RGBA, GL_FLOAT, g_fsbuf);
 		for (int c = 0; c < 2; c++) /* face tracker results: tally states, the Kinect's into the room */
 			if (g_vtf[c] && vtf_get(g_vtf[c], &g_fo[c])) {
 				g_fstate[c][g_fo[c].state < 6 ? g_fo[c].state : 0]++;
@@ -3317,15 +3315,8 @@ int main(int argc, char **argv)
 		}
 		/* frame generation: a field still due within 4 ms of its frame's arrival is waited for, so the generated
 		 * image makes this refresh instead of the next (field 1.8-2.2 ms, refresh 8.33 ms at 120 Hz) */
-		if (g_fgk.gen && g_fg && g_fgk.phase == 0 && fsr_wait(g_fsk, g_fgk.t_arr[g_fgk.seq % 4] + 0.004) && fsr_poll(g_fsk, g_fsbuf, g_rawbuf, fseq)) {
-			glTextureSubImage2D(t_fsk, 0, 0, 0, 80, 60, GL_RGBA, GL_FLOAT, g_fsbuf);
-			fg_field(&g_fgk, fseq);
-			nfk_fsr++;
-		}
-		if (g_fgw.gen && g_fg && g_fgw.phase == 0 && fsr_wait(g_fsw, g_fgw.t_arr[g_fgw.seq % 4] + 0.004) && fsr_poll(g_fsw, g_fsbuf, g_rawbuf, fseq)) {
-			glTextureSubImage2D(t_fsw, 0, 0, 0, 80, 60, GL_RGBA, GL_FLOAT, g_fsbuf);
-			fg_field(&g_fgw, fseq);
-		}
+		if (g_fgk.gen && g_fg && g_fgk.phase == 0 && fsr_wait_mid(g_fsk, g_fgk.t_arr[g_fgk.seq % 4] + 0.004) && fsr_poll_mid(g_fsk, g_rawbuf, fseq)) fg_field(&g_fgk, fseq);
+		if (g_fgw.gen && g_fg && g_fgw.phase == 0 && fsr_wait_mid(g_fsw, g_fgw.t_arr[g_fgw.seq % 4] + 0.004) && fsr_poll_mid(g_fsw, g_rawbuf, fseq)) fg_field(&g_fgw, fseq);
 		const double tdraw = now_s(); /* frame generation: what each camera shows at this refresh */
 		g_show_k = g_fgk.gen ? fg_display(&g_fgk, tdraw) : t_rgb;
 		g_show_w = g_fgw.gen ? fg_display(&g_fgw, tdraw) : t_wrgb;
