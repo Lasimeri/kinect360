@@ -308,6 +308,9 @@ gradient correlation has one sharp peak (0.745, the best point outside 16 px 0.5
   webcam focal length and no lens distortion in the model, is not tested; nor is which of its poses is the true one.
 - The still-scene pose moved by 1.7 deg between two sessions 8 minutes apart with no camera knowingly touched:
   whether a camera moved or the optimum follows the scene is not settled.
+- The face tracker lets a region go after 30 detections in a row without a face (one session held a region as
+  observed 77 % of the time with 294 faces in 45,915 detections); with a face in view nothing changed (20 s,
+  201 of 201 detections), but the letting go itself has not been seen live.
 - The colour lookup's time shift is built on the measured flow but its own effect under motion is not measured (the
   rooms it ran in were nearly still); the webcam fill's remaining splatter is not separated from the two cameras'
   colour differences.

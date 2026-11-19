@@ -3922,11 +3922,11 @@ int main(int argc, char **argv)
 		const unsigned *s = g_fstate[c];
 		const double r = g_fres[c] ? 100.0 / g_fres[c] : 0.0;
 		printf("kinect3d: face tracker %s: %u results: observed %.1f %%, unobserved %.1f %%, new %.1f %%, lost %.1f %%, none %.1f %%; "
-		       "tracker %.3f ms mean %.3f max; YuNet %.2f ms, %llu runs, %llu faces; selects %llu (after lost %llu, drift %llu); "
+		       "tracker %.3f ms mean %.3f max; YuNet %.2f ms, %llu runs, %llu faces; selects %llu (after lost %llu, drift %llu), let go without a face %llu; "
 		       "box on the face (IoU >= 0.5 at a detection) %llu of %llu = %.1f %%, centre inside the face %.1f %%, centre error %.3f face widths (mean)\n",
 		       c ? "webcam" : "Kinect", g_fres[c], s[VTF_OBSERVED] * r, s[VTF_UNOBSERVED] * r, s[VTF_NEW] * r, s[VTF_LOST] * r, s[VTF_NONE] * r,
 		       o->track_ms, o->track_ms_max, o->face_ms, (unsigned long long)o->detections, (unsigned long long)o->faces,
-		       (unsigned long long)o->selects, (unsigned long long)o->reselect_lost, (unsigned long long)o->reselect_drift,
+		       (unsigned long long)o->selects, (unsigned long long)o->reselect_lost, (unsigned long long)o->reselect_drift, (unsigned long long)o->let_go,
 		       (unsigned long long)o->on_face, (unsigned long long)o->judged, o->judged ? 100.0 * (double)o->on_face / (double)o->judged : 0.0,
 		       o->judged ? 100.0 * (double)o->centre_in / (double)o->judged : 0.0, o->judged ? o->centre_err / (double)o->judged : 0.0);
 		vtf_close(g_vtf[c]);

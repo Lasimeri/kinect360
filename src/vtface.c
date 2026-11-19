@@ -24,7 +24,7 @@
 
 struct vtface {
 	char name[16];
-	int w, h, sets, face_every, drift_run, started, pending, quit, fresh;
+	int w, h, sets, face_every, drift_run, miss_run, started, pending, quit, fresh;
 	uint64_t i;
 	struct tracker *tk;
 	facetrack *ft;
@@ -127,6 +127,7 @@ static void step(vtface *v, const uint8_t *rgb, double t)
 		const int nf = ft_detect(v->ft, rgb, &f);
 		o->face_ms += (ms_since(&a) - o->face_ms) / (double)(++o->detections);
 		o->iou = -1.0f;
+		v->miss_run = nf > 0 && f.score >= 0.6f ? 0 : v->miss_run + (active ? 1 : 0); /* detections in a row that found no face while a region is held */
 		if (nf > 0 && f.score >= 0.6f) {
 			o->faces++;
 			memcpy(o->face, f.box, sizeof o->face);
@@ -163,6 +164,9 @@ static void step(vtface *v, const uint8_t *rgb, double t)
 	m.length = (uint32_t)n;
 	m.instance = v->i;
 	m.acq_ns = (uint64_t)(t * 1e9);
+	/* A region YuNet has not found a face in for 30 detections in a row (3 s at every third frame) is let go: the tracker
+	 * holds whatever it was given, and one live session read "observed" 77 % of the time with 294 faces in 45,915 detections */
+	if (!select && active && v->miss_run >= 30) { m.cmd = VT_CMD_DESELECT; v->miss_run = 0; o->let_go++; }
 	if (select) {
 		float x0 = fmaxf(0.0f, o->face[0]), y0 = fmaxf(0.0f, o->face[1]);
 		float x1 = fminf((float)v->w, o->face[0] + o->face[2]), y1 = fminf((float)v->h, o->face[1] + o->face[3]);

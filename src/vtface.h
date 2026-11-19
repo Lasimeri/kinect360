@@ -22,7 +22,7 @@ typedef struct {
 	uint64_t face_seq;             /* detections with a face so far: a new one when this grows */
 	float iou;                     /* region against that box, at the newest detection; -1 none */
 	double t;                      /* capture time of the frame this result is of, s (the caller's clock) */
-	uint64_t frames, detections, faces, selects, reselect_drift, reselect_lost, on_face, judged, centre_in; /* centre_in: box centre inside the YuNet box */
+	uint64_t frames, detections, faces, selects, reselect_drift, reselect_lost, on_face, judged, centre_in, let_go; /* centre_in: box centre inside the YuNet box; let_go: regions dropped after 30 detections without a face */
 	double centre_err;             /* sum over judged detections: |box centre - face centre| / face width */
 	double track_ms, track_ms_max, face_ms; /* tk_build + tk_track per frame (mean, max); YuNet per detection (mean) */
 	int nshow;                     /* features to draw: member ones first */
