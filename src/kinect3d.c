@@ -2610,7 +2610,7 @@ static void al_shift_pose(const double R[9], const double t[3], double du, doubl
  *     one evaluation (the gradients and 1 correlation), and solve again only if the pose has lost 0.1 (a camera was
  *     moved) or the A key asks. */
 static struct {
-	int settled, pending;
+	int settled, pending, strong;
 	double R[9], t[3], level, t_next;
 	unsigned still_run, solves, confirmed, dropped, checks;
 } g_as;
@@ -2621,9 +2621,11 @@ static double now_s(void);
  * different, shifts of (+4, -20), (-8, +14), (-42, +80), (+4, -72) px, the last two 7.9 and 11.7 deg with 255 and
  * 556 mm of translation. The optimum follows what is in the scene (the model has a fixed focal length and no
  * distortion, and the pose makes up for them where the texture is). So within a session a pose may adapt, but
- * no further than 4 deg and 120 mm from the anchor, at most once a minute, and it is not saved: the file changes
+ * no further than 4 deg and 120 mm from the anchor, at most once a minute, and it is not saved. Two things pass the
+ * bound and become the anchor, saved at exit: strong evidence (held out at least 0.6 and 0.25 above the pose in
+ * use, twice: the solve and the new frames), and the A key. So the file changes
  * only after the A key asked for a solve (then without the bound, and the result becomes the anchor). */
-static struct { int have, asked; double R[9], t[3]; double t_applied; } g_anchor;
+static struct { int have, asked, save; double R[9], t[3]; double t_applied; } g_anchor;
 
 static void al_anchor_init(void)
 {
@@ -2666,7 +2668,7 @@ static void al_round(void)
 	g_as.checks++;
 	if (g_as.pending) { /* the candidate on frames it was not found on */
 		const double all_cand = al_bg_ncc(g_as.R, g_as.t, &n);
-		const int ok = all_cand >= all_use + 0.05;
+		const int ok = all_cand >= all_use + (g_as.strong ? 0.25 : 0.05);
 		printf("align: still scene: the candidate on new frames: correlation %.3f against %.3f for the pose in use (%d points): %s\n", all_cand, all_use, n,
 		       ok ? "CONFIRMED and applied" : "dropped");
 		if (ok) {
@@ -2675,7 +2677,7 @@ static void al_round(void)
 			g_as.settled = 1;
 			g_as.level = all_cand;
 			g_anchor.t_applied = now_s();
-			if (g_anchor.asked) { g_anchor.have = 0; al_anchor_init(); g_anchor.asked = 2; } /* asked for: the new anchor, saved at exit */
+			if (g_anchor.asked || g_as.strong) { g_anchor.have = 0; al_anchor_init(); g_anchor.asked = 0; g_anchor.save = 1; } /* asked for, or strong: the new anchor, saved at exit */
 		} else { g_as.dropped++; if (g_anchor.asked == 1) g_anchor.asked = 0; }
 		g_as.pending = 0;
 		g_as.t_next = now_s() + (ok ? 60.0 : 10.0);
@@ -2715,12 +2717,14 @@ static void al_round(void)
 		for (int k = 0; k < 3; k++) tr += R[3 * i + k] * R0[3 * i + k];
 	const double drot = acos(fmax(-1.0, fmin(1.0, 0.5 * (tr - 1.0)))) * 57.29577951308232;
 	const double dt = sqrt((t[0] - t0[0]) * (t[0] - t0[0]) + (t[1] - t0[1]) * (t[1] - t0[1]) + (t[2] - t0[2]) * (t[2] - t0[2]));
-	const int bounded = al_near_anchor(R, t), ok = ntest >= 2000 && test_new >= test_old + 0.05 && bounded;
+	/* strong evidence passes the bound: a camera that was re-aimed reads like this (0.28 -> 0.79 held out, 20:09), the scene's pull on the optimum does not */
+	const int strong = test_new >= 0.6 && test_new >= test_old + 0.25;
+	const int bounded = al_near_anchor(R, t) || strong, ok = ntest >= 2000 && test_new >= test_old + 0.05 && bounded;
 	g_as.solves++;
 	printf("align: still scene: gradient correlation, fitted half %.3f -> %.3f, held-out half %.3f -> %.3f (%d points); whole-picture shift found (%+.0f, %+.0f) px; "
 	       "change %.2f deg %.1f mm; %.0f ms: %s\n", train_old, train_new, test_old, test_new, ntest, bu, bv, drot, dt, 1e3 * (now_s() - t_start),
 	       ok ? "a candidate, to be confirmed on new frames" : !bounded ? "further than 4 deg or 120 mm from the session's anchor: the pose in use stands" : "the pose in use stands");
-	if (ok) { memcpy(g_as.R, R, sizeof R); memcpy(g_as.t, t, sizeof t); g_as.pending = 1; g_as.t_next = now_s() + 2.0; }
+	if (ok) { memcpy(g_as.R, R, sizeof R); memcpy(g_as.t, t, sizeof t); g_as.pending = 1; g_as.strong = strong; g_as.t_next = now_s() + 2.0; }
 	else { g_as.settled = 1; g_as.level = all_use; g_as.t_next = now_s() + 10.0; if (g_anchor.asked == 1) g_anchor.asked = 0; }
 out:
 	g_bg_part = -1;
@@ -3905,8 +3909,8 @@ int main(int argc, char **argv)
 		printf("kinect3d: face alignment: detections still K %u W %u, moving %u, pairs %u (unpaired in time %u), kept %u, %d correspondences, "
 		       "head travel %.0f mm, solves %u, applied %u, cleared by the motor %u; still scene: %u checks, %u solves, %u confirmed, %u dropped\n", g_al.still_k, g_al.still_w, g_al.unstill, g_al.pairs, g_al.untimed, g_al.kept, g_al.n,
 		       g_al.spread, g_al.solves, g_al.applied, g_al.resets, g_as.checks, g_as.solves, g_as.confirmed, g_as.dropped);
-		if (g_al.applied && g_anchor.asked != 2) printf("kinect3d: the session's pose adaptations are not saved (the A key solves and keeps)\n");
-		if (g_al.applied && g_anchor.asked == 2) {
+		if (g_al.applied && !g_anchor.save) printf("kinect3d: the session's pose adaptations are not saved (the A key solves and keeps)\n");
+		if (g_al.applied && g_anchor.save) {
 			char ap[512];
 			snprintf(ap, sizeof ap, "%s/kinect360/calib/webcam-aligned.txt", getenv("HOME") ? getenv("HOME") : ".");
 			printf("kinect3d: aligned pose %s %s (the next start loads it; calib/webcam.txt untouched)\n", save_calib(ap) ? "NOT written to" : "written to", ap);

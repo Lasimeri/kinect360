@@ -165,7 +165,9 @@ every dropped pixel for 2 frames wherever it was, which left an outline behind e
   settled, a check every 10 s costs one evaluation and solves again only if the pose has lost 0.1. Even confirmed,
   the optimum follows what is in the scene: one 30 minute session with the cameras untouched confirmed four
   different poses, the last two 7.9 and 11.7 deg from where it began. So a session may adapt its pose by at most
-  4 deg and 120 mm from the pose it started with, once a minute, and does not save it; the file changes only after
+  4 deg and 120 mm from the pose it started with, once a minute, and does not save it. Strong evidence passes the
+  bound and is saved (held out at least 0.6 and 0.25 above the pose in use, on the solve and again on new frames: a
+  re-aimed camera reads like that, 0.287 to 0.788 in one case); otherwise the file changes only after
   the A key asked for a solve.
 
 **Face tracker.** VisionTrack's region tracker (`src/kern/track.c` with its LK, Kalman and take-back, unmodified)
