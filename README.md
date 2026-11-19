@@ -162,7 +162,11 @@ every dropped pixel for 2 frames wherever it was, which left an outline behind e
   frames of a still room (about 0.35 s, once; the A key asks again). A solve that gains 0.05 held out is only a
   candidate: 2 s later, on new frames, it must beat the pose in use by 0.05 over every point or it is dropped. A
   first version applied a single solve and took a 3.2 deg error from frames of a room that was not still. Once
-  settled, a check every 10 s costs one evaluation and solves again only if the pose has lost 0.1.
+  settled, a check every 10 s costs one evaluation and solves again only if the pose has lost 0.1. Even confirmed,
+  the optimum follows what is in the scene: one 30 minute session with the cameras untouched confirmed four
+  different poses, the last two 7.9 and 11.7 deg from where it began. So a session may adapt its pose by at most
+  4 deg and 120 mm from the pose it started with, once a minute, and does not save it; the file changes only after
+  the A key asked for a solve.
 
 **Face tracker.** VisionTrack's region tracker (`src/kern/track.c` with its LK, Kalman and take-back, unmodified)
 runs per camera on a worker thread; YuNet places its box on the face and places it again when the region is lost
@@ -298,6 +302,8 @@ gradient correlation has one sharp peak (0.745, the best point outside 16 px 0.5
 - The joint face plus background solve ran in one session (5 solves, 2 applied): the held-out face error barely
   moved (8.8 to 8.3 px) and the background correlation rose by 0.03 at most. It has not shown that it finds a
   better pose than the still-scene solve does alone.
+- The still-scene solve is not a calibration: its optimum moves with the scene (above). The likely cause, a fixed
+  webcam focal length and no lens distortion in the model, is not tested; nor is which of its poses is the true one.
 - The still-scene pose moved by 1.7 deg between two sessions 8 minutes apart with no camera knowingly touched:
   whether a camera moved or the optimum follows the scene is not settled.
 - The colour lookup's time shift is built on the measured flow but its own effect under motion is not measured (the
