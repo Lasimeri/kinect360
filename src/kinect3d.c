@@ -82,9 +82,9 @@ static const char GLSL_COMMON[] =
 	"  float z = float(wz);\n"
 	"  vec3 X = vec3(float(p.x - 320) * u_k * z, float(p.y - 240) * u_k * z, z);\n"
 	"  if (u_tshift != 0.0) {\n"
-	"    vec4 v = texelFetch(t_velm, p, 0);\n"
+	"    vec4 v = texelFetch(t_velm, p >> 3, 0);\n" /* the 8 x 8 cell's velocity, w = its valid pixels */
 	"    float zm = z * 1e-3;\n"
-	"    if (v.w > 0.5 && length(v.xyz) >= 150.0 + 40.0 * zm * zm) X += u_tshift * (transpose(u_Rcam) * v.xyz);\n"
+	"    if (v.w >= 8.0 && length(v.xyz) >= 150.0 + 40.0 * zm * zm) X += u_tshift * (transpose(u_Rcam) * v.xyz);\n"
 	"  }\n"
 	"  return u_mvp * vec4(X.x, -X.y, -X.z, 1.0);\n"
 	"}\n"
@@ -736,7 +736,7 @@ static GLint loc_mvp[2], loc_k[2], loc_cull[2], loc_occl[2], loc_tshift[2], loc_
 static int g_geo = 1;          /* geometry follows the instant of the colour on screen (T) */
 static float g_tshift;         /* this draw's shift, s */
 static double g_tshift_sum, g_t_rgb;
-static unsigned g_tshift_n;
+static unsigned g_tshift_n, g_geo_states; /* geometry states shown: a new depth frame, or a new shift (> 1 ms) on it */
 static float g_k, g_cull = 0.04f;
 static int g_occl = 1, g_method = DEFAULT_METHOD;
 static GLuint t_win, t_wz, t_pmap, p_win, p_pmap, p_wz, t_draw, t_dtemp, p_dfill;
@@ -1022,6 +1022,7 @@ static struct {
 	float Rnow[9], Rprev[9]; /* camera -> room, rows: right, up, forward */
 } g_room = {.up = {0, -1, 0}, .X = {1, 0, 0}, .sx = 1, .sz = 1, .ceil_angle = NAN, .wall_left = NAN, .wall_right = NAN, .wall_ahead = NAN};
 static float g_cvb[80 * 60 * 4], g_cpb[80 * 60 * 4];
+static int g_vsmooth = 1; /* the cells' velocities smoothed over space and time (--raw-vel: off) */
 static struct { unsigned n; double pos[3], vel[3]; } g_mov;
 
 static void v3norm(double v[3]) { double n = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); if (n > 0) for (int i = 0; i < 3; i++) v[i] /= n; }
@@ -1190,9 +1191,9 @@ static void sflow_setup(void)
 	t_dprev = tex2d(GL_R16UI, W, H, 0);
 	t_winprev = tex2d(GL_R32UI, W, H, 0);
 	t_vel = tex2d(GL_RGBA32F, W, H, 0);
-	glBindTextureUnit(16, t_vel); /* the mesh reads it to move vertices to the colour's instant */
 	t_pos = tex2d(GL_RGBA32F, W, H, 0);
 	t_cv = tex2d(GL_RGBA32F, 80, 60, 0);
+	glBindTextureUnit(16, t_cv); /* the mesh reads the cells' (smoothed) velocities to move vertices to the colour's instant */
 	t_cp = tex2d(GL_RGBA32F, 80, 60, 0);
 	p_sflow = build_program(S_SF, -1, -1);
 	p_cells = build_program(S_CE, -1, -1);
@@ -1225,6 +1226,43 @@ static void sflow_step(double period, GLuint flowtex)
 	glMemoryBarrier(GL_TEXTURE_FETCH_BARRIER_BIT | GL_TEXTURE_UPDATE_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 	glGetTextureImage(t_cv, 0, GL_RGBA, GL_FLOAT, sizeof g_cvb, g_cvb);
 	glGetTextureImage(t_cp, 0, GL_RGBA, GL_FLOAT, sizeof g_cpb, g_cpb);
+	if (g_vsmooth) { /* the cells' 3D velocities, smoothed: what the arrows, the moving test and the title read */
+		/* A velocity is a difference of two depth frames: one depth step at 3 m (26 mm) in 33 ms reads as 780 mm/s, whatever
+		 * the image vectors say. Over space: the mean of the 3 x 3 cells on the same surface (depth within 10 %), weighted
+		 * by their valid pixels. Over time: an EMA of 0.35 per cell, restarted when the new value leaves the old by more
+		 * than twice the noise floor at that depth (2 (150 + 40 z^2) mm/s): a real start or stop is not smeared. */
+		static float sm[80 * 60 * 3], sp[80 * 60 * 3];
+		static uint8_t ok[80 * 60];
+		for (int cy = 0; cy < 60; cy++)
+			for (int cx = 0; cx < 80; cx++) {
+				const int c = cy * 80 + cx;
+				const float *v = g_cvb + 4 * c, *x = g_cpb + 4 * c;
+				float s[3] = {0, 0, 0}, wsum = 0;
+				if (v[3] >= 8 && x[3] >= 8)
+					for (int dy = -1; dy <= 1; dy++)
+						for (int dx = -1; dx <= 1; dx++) {
+							const int nx = cx + dx, ny = cy + dy;
+							if (nx < 0 || ny < 0 || nx >= 80 || ny >= 60) continue;
+							const float *nv = g_cvb + 4 * (ny * 80 + nx), *np = g_cpb + 4 * (ny * 80 + nx);
+							if (nv[3] < 8 || np[3] < 8 || fabsf(np[2] - x[2]) > 0.1f * x[2]) continue;
+							for (int i = 0; i < 3; i++) s[i] += nv[3] * nv[i];
+							wsum += nv[3];
+						}
+				for (int i = 0; i < 3; i++) sp[3 * c + i] = wsum > 0 ? s[i] / wsum : 0;
+				if (wsum <= 0) ok[c] = 0;
+			}
+		for (int c = 0; c < 80 * 60; c++) {
+			float *v = g_cvb + 4 * c, *m = sm + 3 * c;
+			const float *x = g_cpb + 4 * c, *s = sp + 3 * c;
+			if (v[3] < 8 || x[3] < 8) continue;
+			const float zm = x[2] * 1e-3f, lim = 2.0f * (150.0f + 40.0f * zm * zm);
+			const float d = sqrtf((s[0] - m[0]) * (s[0] - m[0]) + (s[1] - m[1]) * (s[1] - m[1]) + (s[2] - m[2]) * (s[2] - m[2]));
+			if (!ok[c] || d > lim) { m[0] = s[0]; m[1] = s[1]; m[2] = s[2]; ok[c] = 1; }
+			else for (int i = 0; i < 3; i++) m[i] += 0.35f * (s[i] - m[i]);
+			v[0] = m[0]; v[1] = m[1]; v[2] = m[2];
+		}
+		glTextureSubImage2D(t_cv, 0, 0, 0, 80, 60, GL_RGBA, GL_FLOAT, g_cvb); /* the arrows draw from it */
+	}
 	/* what moves: cells with >= 8 valid pixels and >= 200 mm/s, weighted by their valid count */
 	double w = 0, ps[3] = {0, 0, 0}, vs[3] = {0, 0, 0};
 	unsigned n = 0;
@@ -2865,9 +2903,10 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--analyze")) do_analyze = 1;
 		else if (!strcmp(argv[i], "--lock")) g_lock = 1;
 		else if (!strcmp(argv[i], "--flow-source") && i + 1 < argc) g_fsrc = strcmp(argv[++i], "lk") != 0;
-		else if (!strcmp(argv[i], "--fsr-vec") && i + 1 < argc) { const char *m = argv[++i]; fsr_vector_mode(!strcmp(m, "ema") ? 0 : !strcmp(m, "lk-all") ? 2 : 1); }
+		else if (!strcmp(argv[i], "--fsr-vec") && i + 1 < argc) { const char *m = argv[++i]; fsr_vector_mode(!strcmp(m, "ema") ? 0 : !strcmp(m, "lk") ? 1 : !strcmp(m, "lk-all") ? 2 : !strcmp(m, "gen") ? 3 : !strcmp(m, "lk-ema") ? 4 : !strcmp(m, "gen-ema") ? 5 : 6); }
 		else if (!strcmp(argv[i], "--no-fg")) g_fg = 0;
 		else if (!strcmp(argv[i], "--no-geo-time")) g_geo = 0;
+		else if (!strcmp(argv[i], "--raw-vel")) g_vsmooth = 0;
 		else if (!strcmp(argv[i], "--no-face-track")) g_facetrack = 0;
 		else if (!strcmp(argv[i], "--no-align")) g_align = 0;
 		else if (!strcmp(argv[i], "--dump-align") && i + 1 < argc) align_dump = argv[++i];
@@ -3012,7 +3051,7 @@ int main(int argc, char **argv)
 	}
 	double t_title = now_s(), gpu_ema[2] = {0, 0};
 	unsigned nd_prev = atomic_load(&k_ndepth), nv_prev = atomic_load(&k_nrgb), frames = 0;
-	unsigned fgk_prev = 0, fgw_prev = 0; /* frame generation: distinct images shown */
+	unsigned fgk_prev = 0, fgw_prev = 0, geo_prev = 0; /* frame generation: distinct images shown, geometry states */
 	unsigned nfk = 0, nfw = 0, nw_prev = 0;
 	unsigned calib_snap = 0, sf_frames = 0, st_frames = 0, nfk_sf = 0, ndepth_seen = 0, nfk_fsr = 0;
 	double td_prev = 0, d_period = 0;
@@ -3296,6 +3335,9 @@ int main(int argc, char **argv)
 			const double ts = g_geo && g_t_depth > 0 && tcol > 0 && sf_frames ? tcol - g_t_depth : 0.0;
 			g_tshift = (float)(ts > 0.05 ? 0.05 : ts < -0.05 ? -0.05 : ts);
 			if (g_tshift != 0.0f) { g_tshift_sum += fabs(g_tshift); g_tshift_n++; }
+			static unsigned geo_depth;
+			static float geo_shift;
+			if (geo_depth != g_depth_up || fabsf(g_tshift - geo_shift) > 0.001f) { g_geo_states++; geo_depth = g_depth_up; geo_shift = g_tshift; }
 		}
 		glBindTextureUnit(12, g_show_w);
 		glBeginQuery(GL_TIME_ELAPSED, q[qi]);
@@ -3355,10 +3397,10 @@ int main(int argc, char **argv)
 			if (g_fgk.gen) { /* frame generation: distinct images on screen per second, per camera */
 				char fgs[160];
 				const double sk = (g_fgk.shown - fgk_prev) / (t - t_title), sw = (g_fgw.shown - fgw_prev) / (t - t_title);
-				snprintf(fgs, sizeof fgs, " | frame gen %s: shown K %.1f W %.1f fps", g_fg ? "on" : "off", sk, sw);
+				snprintf(fgs, sizeof fgs, " | frame gen %s: shown K %.1f W %.1f fps, geometry %.1f/s%s", g_fg ? "on" : "off", sk, sw, (g_geo_states - geo_prev) / (t - t_title), g_geo ? "" : " (T off)");
 				strncat(title, fgs, sizeof title - strlen(title) - 1);
-				if (stats_n > 0 || fg_test > 0) printf("fg: %s shown K %.1f W %.1f fps (camera %.1f / %.1f, render %.1f) generated K %u W %u\n", g_fg ? "on" : "off",
-								      sk, sw, (nv - nv_prev) / (t - t_title), (nw - nw_prev) / (t - t_title), frames / (t - t_title), g_fgk.made, g_fgw.made);
+				if (stats_n > 0 || fg_test > 0 || face_stats > 0) printf("fg: %s shown K %.1f W %.1f fps, geometry %.1f/s, shift %.2f ms (camera %.1f / %.1f, render %.1f) generated K %u W %u\n", g_fg ? "on" : "off",
+								      sk, sw, (g_geo_states - geo_prev) / (t - t_title), 1e3 * g_tshift, (nv - nv_prev) / (t - t_title), (nw - nw_prev) / (t - t_title), frames / (t - t_title), g_fgk.made, g_fgw.made);
 			}
 			if (sf_frames) { /* room frame: x right (along a wall), y up (gravity), z forward; origin = Kinect */
 				char rm[300];
@@ -3380,7 +3422,7 @@ int main(int argc, char **argv)
 			}
 			glfwSetWindowTitle(win, title);
 			nd_prev = nd; nv_prev = nv; nw_prev = nw; frames = 0; t_title = t;
-			fgk_prev = g_fgk.shown; fgw_prev = g_fgw.shown;
+			fgk_prev = g_fgk.shown; fgw_prev = g_fgw.shown; geo_prev = g_geo_states;
 		}
 	}
 

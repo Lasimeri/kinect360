@@ -20,7 +20,7 @@ that produced them; what has not been measured is said to be unmeasured.
     │      ┌──────────────────────────────────────────────────────────────────┐              
     │      │ CPU workers, one of each per camera                              │              
     │      │ FSR3 flow (cpus 0-3, 4-7): AMD field, 8x8 px blocks, 1.4-1.9 ms  │              
-    │      │ + VisionTrack LK step on every block: 0.085 px median error      │              
+    │      │ + VisionTrack LK step, smoothed: 0.106 px at noise sigma 2       │              
     │      │ VisionTrack track.c, O3-native: 3.7-6.3 ms a frame; YuNet 18 ms  │              
     │      └──────┬──────────────────────┬────────────────────────┬───────────┘              
     │             │ vectors              │ mid field              │ boxes, landmarks         
@@ -83,8 +83,8 @@ out/kinect3d --fg-test 30          # frame generation against ground truth (belo
 | `--webcam DEV\|none` | webcam device (default `/dev/video2`) |
 | `--calib FILE\|none` | webcam pose; default `calib/webcam-aligned.txt` if it exists, else `calib/webcam.txt` |
 | `--flow-source fsr\|lk` | velocity field from the FSR 3 flow (default) or the GPU Lucas-Kanade flow |
-| `--fsr-vec lk-all\|lk\|ema` | the FSR flow's vectors: VisionTrack's LK refinement on every block (default), on moving blocks only, or an EMA over whole pixels |
-| `--no-fg`, `--no-geo-time`, `--no-face-track`, `--no-align` | turn a part off |
+| `--fsr-vec smooth\|lk-all\|lk\|gen\|lk-ema\|gen-ema\|ema` | the FSR flow's vectors (below); default `smooth` |
+| `--no-fg`, `--no-geo-time`, `--no-face-track`, `--no-align`, `--raw-vel` | turn a part off (`--raw-vel`: the cells' velocities unsmoothed) |
 | `--fg-test S`, `--face-stats S`, `--scene-stats N` | measurements, then exit |
 | `--dump-align DIR` | one frame of each camera, the point map and the pose, for `out/alscape` |
 | `--calib-face DIR S`, `--calib-track DIR S`, `--calib-dump DIR` | calibration captures (`make calibrate-face`, `calibrate-track`, `calibrate`) |
@@ -109,7 +109,19 @@ threads each): whole-pixel vectors per 8 x 8 block. The engine's own `engine.c` 
 so `src/fsrflow.c` drives `flow_init` / `flow_land` / `flow_make` with a state per camera. Each block's vector is
 then refined below a pixel by VisionTrack's one-step Lucas-Kanade (`refine_block`, from
 [Intel-Phi-VisionTrack](https://github.com/Lasimeri/Intel-Phi-VisionTrack) `src/kern/fsr3.c`) against the older
-frame moved by the vector, over a 16 x 16 window; mode `lk-all` also refines blocks the field calls still.
+frame moved by the vector, over a 16 x 16 window, on every block (VisionTrack refines moving blocks only: mode
+`lk`). The default, `smooth`, then averages each vector with those of the 3 x 3 blocks that agree with it within
+1 px (smoothing over space does not lag) and runs an alpha-beta filter (0.6, 0.2) over time, which follows a
+steady acceleration without lag. Mode `gen` takes the vectors through the generated frame instead (two half
+steps: newer to generated, generated to older); it measures no better than the direct step (below), as
+VisionTrack found for its tracker ("It adds no information: everything in a generated frame comes from the two
+real ones").
+
+**Velocity smoothing.** A 3D velocity is a difference of two depth frames: one depth step at 3 m (26 mm) in 33 ms
+reads as 780 mm/s whatever the image vectors say. So the cells' velocities are averaged over the 3 x 3 cells on
+the same surface (depth within 10 %) and over time (EMA 0.35, restarted when a value leaves the mean by more than
+twice the noise floor at that depth, so a start or a stop is not smeared). The arrows, the moving test and the
+mesh's time shift read the smoothed cells.
 
 **Frame generation.** The flow's mid-instant field moves the older frame half way forward and the newer half way
 back (the convention of the flow's own `sad_mid`), bilinear between block centres; one compute dispatch per
@@ -153,21 +165,32 @@ Raw logs live in `out/` on the machine (not published: frames of the room live t
 | GPU LK flow vs OpenCV `calcOpticalFlowPyrLK` | `out/flowcheck` | median 0.0016 px |
 | webcam rate after `exposure_dynamic_framerate` 0 | live | 29.88 fps (was 10.5) |
 
-**Motion vectors, ground truth** (`out/vectest FRAME.rgb`: a real frame moved by known sub-pixel steps, 24
-frames, error over interior blocks after 12 frames; median error in px; Kinect frame, the webcam frame agrees):
+**Motion vectors, ground truth** (`out/vectest FRAME.rgb SIGMA`: a real Kinect frame moved by known sub-pixel
+steps, independent Gaussian noise of SIGMA grey levels on every frame, 24 frames, median error in px over interior
+blocks after 12 frames). At SIGMA 2:
 
-| v (px/frame) | EMA over whole pixels | VisionTrack LK | VisionTrack LK, still blocks too |
-|---|---|---|---|
-| (0.30, 0) | 0.300 | 0.300 | **0.073** |
-| (0.50, 0.50) | 0.707 | 0.707 | **0.074** |
-| (1.25, -0.40) | 0.504 | **0.072** | **0.072** |
-| (2.60, 1.70) | 0.654 | **0.087** | **0.087** |
-| (-4.30, 0.80) | 0.626 | **0.069** | **0.069** |
-| (7.20, -3.10) | 0.407 | 0.218 | 0.218 |
-| mean of medians (Kinect / webcam frame) | 0.457 / 0.471 | 0.208 / 0.212 | **0.085 / 0.088** |
+| v (px/frame) | `ema` | `lk-all` | `gen` | `lk-ema` | `gen-ema` | `smooth` |
+|---|---|---|---|---|---|---|
+| (0, 0) | 0.000 | 0.075 | 0.087 | 0.025 | 0.027 | 0.031 |
+| (0.30, 0) | 0.280 | 0.131 | 0.123 | 0.072 | 0.056 | 0.072 |
+| (0.50, 0.50) | 0.248 | 0.301 | 0.329 | 0.104 | 0.216 | 0.109 |
+| (1.25, -0.40) | 0.341 | 0.230 | 0.222 | 0.105 | 0.136 | 0.109 |
+| (2.60, 1.70) | 0.333 | 0.248 | 0.176 | 0.109 | 0.098 | 0.113 |
+| (-4.30, 0.80) | 0.314 | 0.201 | 0.252 | 0.108 | 0.159 | 0.115 |
+| (7.20, -3.10) | 0.224 | 0.224 | 0.330 | 0.139 | 0.199 | 0.146 |
+| sway, 6 px in 0.8 s (never constant) | 0.653 | 0.137 | 0.151 | 0.651 | 0.664 | 0.156 |
+| **mean** | 0.299 | 0.193 | 0.209 | 0.164 | 0.194 | **0.106** |
 
-At 7.8 px/frame about 45 % of blocks fail in the engine's whole-pixel search itself (p90 7.26 px), before any
-refinement.
+| Mean of the 8 medians | `ema` | `lk-all` | `gen` | `lk-ema` | `gen-ema` | `smooth` |
+|---|---|---|---|---|---|---|
+| SIGMA 0 | 0.480 | 0.082 | 0.169 | 0.144 | 0.208 | **0.066** |
+| SIGMA 2 | 0.299 | 0.193 | 0.209 | 0.164 | 0.194 | **0.106** |
+| SIGMA 4 | 0.449 | 0.554 | 0.592 | 0.422 | 0.428 | **0.348** |
+
+An average over time alone (`lk-ema`, `gen-ema`) halves the error at a constant velocity and lags a changing one
+(the sway: 0.65 px); `smooth` does not. Vectors through the generated frame (`gen`) are within 0.02 px of the
+direct ones under noise and worse without it. At 7.8 px/frame about 45 % of blocks fail in the engine's
+whole-pixel search itself, before any refinement.
 
 **Frame generation** (`--fg-test S`: a third flow instance sees every second Kinect frame; the frame generated
 between k-1 and k+1 is compared with the real frame k; PSNR over pixels that move, 3 runs of 20-30 s):
@@ -194,7 +217,19 @@ screen: 602 Kinect frames became 1,204 images (exactly 2x), 59.98 (Kinect) and 5
 | >= 3 m | 130.3 / 116.8 | 187.1 / 121.4 |
 
 The FSR flow covers 4-16 times more cells and raises 3-25 times more false moving cells. Movement in the room
-contaminated round 1. Not yet repeated with VisionTrack's vectors.
+contaminated round 1.
+
+With the `smooth` vectors, the cells' velocities raw (`--raw-vel`) against smoothed (two interleaved rounds, a still
+room, median / 90th percentile of |v|, mm/s):
+
+| Depth | raw | smoothed |
+|---|---|---|
+| 1-2 m | 9.8 / 51.6, 9.4 / 47.4 | 6.0 / 20.3, 5.4 / 21.7 |
+| 2-3 m | 48.8 / 250.5, 46.6 / 236.3 | 25.4 / 124.9, 27.7 / 135.2 |
+| >= 3 m | 94.3 / 328.1, 90.5 / 302.3 | 58.1 / 139.2, 58.6 / 151.7 |
+
+**Geometry at the colour's instant** (`--fg-test 15`, with and without `--no-geo-time`): 63.0 distinct geometry
+states a second on screen against 30.0, the mean shift 18.2 ms.
 
 **Face tracker** (`--face-stats 60`, 3 runs): 3.7-7.6 ms (Kinect) and 5.4-8.4 ms (webcam) a frame, results at up to 29.6 and 28.3 Hz;
 observed in 85.7-99.9 % of frames (the low end with large, fast head movement); the box's centre inside the face at 99.6-100.0 % of detections, 0.05-0.20
@@ -215,9 +250,10 @@ gradient correlation has one sharp peak (0.745, the best point outside 16 px 0.5
 
 - The joint face plus background solve has been built but not yet seen deciding live: the one run so far had no
   face in the webcam's view.
-- Geometry at the colour's instant: built and through the shader gate; not yet run on the cameras.
-- VisionTrack's vectors on still blocks (the default) on real sensor noise: the ground truth is noise-free;
-  the live noise floor of the three vector modes is not measured yet.
+- Geometry at the colour's instant moves vertices by their cell's velocity; the depth surface itself still
+  changes 30 times a second. Its picture quality has no ground truth test yet, only the count of states.
+- The window's memory grew by about 78 MB an hour in one 90 minute session (2 samples of an earlier build): not
+  profiled.
 - The flow lock (L) does not converge: too few flow correspondences between the two cameras' colours.
 - The first-open black RGB stream after the kernel's `gspca_kinect` held the camera: a restart after 3 s is
   in place; that restart has not been seen working.

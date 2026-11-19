@@ -19,8 +19,10 @@ int fsr_poll(fsrcam *c, float *out, float *raw, uint32_t seq[2]);
 /* block until a field is ready or CLOCK_MONOTONIC reaches deadline_s; 1 when one is ready (fsr_poll takes it) */
 int fsr_wait(fsrcam *c, double deadline_s);
 void fsr_stats(const fsrcam *c, unsigned *fields, unsigned *skipped, unsigned *scene_changes, double *engine_ms);
-/* 2: VisionTrack's refinement on every block (default), 1: on moving blocks only (as VisionTrack), 0: the EMA over whole pixels */
+/* 0 EMA over whole pixels; 1 VisionTrack's LK refinement on moving blocks; 2 on every block; 3 through the generated frame;
+ * 4 = 2 + EMA; 5 = 3 + EMA; 6 = 2 smoothed over 3 x 3 agreeing blocks and an alpha-beta filter over time (default) */
 void fsr_vector_mode(int mode);
+void fsr_filter_gains(float alpha, float beta); /* mode 6 */
 /* blocks refined below a pixel, moving blocks that kept their whole-pixel vector, still blocks; refinement ms per field */
 void fsr_refine_stats(const fsrcam *c, unsigned *refined, unsigned *kept_whole, unsigned *still, double *ms);
 void fsr_close(fsrcam *c);

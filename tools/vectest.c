@@ -1,10 +1,13 @@
 /* vectest: ground truth for the velocity's motion vectors. A real frame is translated by a known sub-pixel
- * velocity v per frame (Catmull-Rom, so the blur does not change with the phase), 24 frames, through the FSR 3
- * port's flow and the adapter (src/fsrflow.c) in both vector modes: 0 = EMA over whole pixels, 1 = VisionTrack's
- * one-step LK refinement. The truth is -v (vectors point newer -> older). Errors over interior blocks, after 12
- * frames (the EMA has converged by then), on all blocks and on the textured half (16 x 16 gradient energy at or
- * above the median). Checks: every frame's field arrives (counted), the engine's own block grid size matches.
- * usage: vectest FRAME.rgb   (640 x 480 RGB24, e.g. from kinect3d --dump-align) */
+ * velocity v per frame (Catmull-Rom, so the blur does not change with the phase), 24 frames, with independent
+ * Gaussian sensor noise of SIGMA grey levels added to every frame, through the FSR 3 port's flow and the adapter
+ * (src/fsrflow.c) in its six vector modes: EMA over whole pixels; VisionTrack's one-step LK on moving blocks; the
+ * same on every block; through the generated frame (newer -> generated -> older); the last two with the EMA
+ * over time. Seven constant velocities and one sway (never constant). The truth is -v (vectors
+ * point newer -> older). Median error over interior blocks after 12 frames (the EMA has converged by then), then
+ * the share of blocks under 0.25 px. Checks: every field arrives (counted); the same noise for every mode (seeded
+ * per velocity and frame).
+ * usage: vectest FRAME.rgb [SIGMA]   (640 x 480 RGB24, e.g. from kinect3d --dump-align; SIGMA default 0) */
 #define _GNU_SOURCE
 #include <math.h>
 #include <stdio.h>
@@ -13,9 +16,9 @@
 #include <time.h>
 #include "../src/fsrflow.h"
 
-enum { W = 640, H = 480, BW = W / 8, BH = H / 8, FRAMES = 24, FROM = 12 };
+enum { W = 640, H = 480, BW = W / 8, BH = H / 8, FRAMES = 24, FROM = 12, MODES = 7, NV = 8 };
 static unsigned char src[W * H * 3], frm[W * H * 3];
-static float out[BW * BH * 4], energy[BW * BH];
+static float out[BW * BH * 4];
 
 static double cr(double p0, double p1, double p2, double p3, double t)
 {
@@ -29,18 +32,26 @@ static double at(int x, int y, int c)
 	return src[3 * (y * W + x) + c];
 }
 
-/* frame(x) = src(x - s): content moved by +s */
-static void shifted(double sx, double sy)
+static uint64_t rs;
+static double uni(void) /* xorshift64*, (0, 1) */
 {
+	rs ^= rs >> 12; rs ^= rs << 25; rs ^= rs >> 27;
+	return ((double)((rs * 0x2545F4914F6CDD1Dull) >> 11) + 0.5) / 9007199254740992.0;
+}
+
+/* frame(x) = src(x - s) + noise: content moved by +s; one noise value a pixel (luma noise), Box-Muller */
+static void shifted(double sx, double sy, double sigma, uint64_t seed)
+{
+	rs = seed * 0x9E3779B97F4A7C15ull + 0x1234567ull;
 	for (int y = 0; y < H; y++)
 		for (int x = 0; x < W; x++) {
 			const double fx = x - sx, fy = y - sy;
 			const int ix = (int)floor(fx), iy = (int)floor(fy);
-			const double tx = fx - ix, ty = fy - iy;
+			const double tx = fx - ix, ty = fy - iy, nz = sigma > 0 ? sigma * sqrt(-2.0 * log(uni())) * cos(6.283185307179586 * uni()) : 0.0;
 			for (int c = 0; c < 3; c++) {
 				double r[4];
 				for (int j = 0; j < 4; j++) r[j] = cr(at(ix - 1, iy - 1 + j, c), at(ix, iy - 1 + j, c), at(ix + 1, iy - 1 + j, c), at(ix + 2, iy - 1 + j, c), tx);
-				const double v = cr(r[0], r[1], r[2], r[3], ty);
+				const double v = cr(r[0], r[1], r[2], r[3], ty) + nz;
 				frm[3 * (y * W + x) + c] = (unsigned char)(v < 0 ? 0 : v > 255 ? 255 : lrint(v));
 			}
 		}
@@ -50,38 +61,37 @@ static int cmpf(const void *a, const void *b) { const float x = *(const float *)
 
 int main(int argc, char **argv)
 {
-	if (argc != 2) { fprintf(stderr, "usage: vectest FRAME.rgb (640 x 480 RGB24)\n"); return 2; }
+	if (argc != 2 && argc != 3 && argc != 6) { fprintf(stderr, "usage: vectest FRAME.rgb [SIGMA [MODE ALPHA BETA]] (640 x 480 RGB24; the last three: one mode, with mode 6's gains)\n"); return 2; }
+	const int only = argc == 6 ? atoi(argv[3]) : -1;
+	if (argc == 6) fsr_filter_gains((float)atof(argv[4]), (float)atof(argv[5]));
+	const double sigma = argc >= 3 ? atof(argv[2]) : 0.0;
 	FILE *f = fopen(argv[1], "rb");
 	if (!f || fread(src, 1, sizeof src, f) != sizeof src) { fprintf(stderr, "vectest: %s is not 921600 bytes of RGB24\n", argv[1]); return 1; }
 	fclose(f);
-	float esort[BW * BH];
-	for (int by = 0; by < BH; by++) /* texture of each block's 16 x 16 window */
-		for (int bx = 0; bx < BW; bx++) {
-			double e = 0;
-			for (int y = by * 8 - 4; y < by * 8 + 12; y++)
-				for (int x = bx * 8 - 4; x < bx * 8 + 12; x++) {
-					const double gx = at(x + 1, y, 1) - at(x - 1, y, 1), gy = at(x, y + 1, 1) - at(x, y - 1, 1);
-					e += gx * gx + gy * gy;
-				}
-			energy[by * BW + bx] = esort[by * BW + bx] = (float)e;
-		}
-	qsort(esort, BW * BH, sizeof esort[0], cmpf);
-	const float emed = esort[BW * BH / 2];
-	static const double V[][2] = {{0, 0}, {0.3, 0}, {0.5, 0.5}, {1.25, -0.4}, {2.6, 1.7}, {-4.3, 0.8}, {7.2, -3.1}};
+	static const double V[NV][2] = {{0, 0}, {0.3, 0}, {0.5, 0.5}, {1.25, -0.4}, {2.6, 1.7}, {-4.3, 0.8}, {7.2, -3.1}, {0, 0}}; /* the last: a sway, below */
+	static const char *const NAME[MODES] = {"EMA whole px", "VT LK moving", "VT LK all", "via generated", "VT LK all + EMA", "via gen + EMA", "VT LK space+a-b"};
 	static const int cpus[4] = {8, 9, 10, 11};
-	static float errs[2][(FRAMES - FROM) * BW * BH];
-	printf("vectest: %s, textured half = 16x16 gradient energy >= %.0f\n", argv[1], (double)emed);
-	printf("%-18s | %-24s | %-24s | %-24s\n", "v (px/frame)", "EMA: med p90 <0.25px", "VisionTrack: med p90 <.25", "VT + still: med p90 <.25");
-	double sum_med[3][2] = {{0}};
-	for (unsigned vi = 0; vi < sizeof V / sizeof V[0]; vi++) {
-		char col[3][2][40];
-		for (int mode = 0; mode < 3; mode++) {
+	static float errs[(FRAMES - FROM) * BW * BH];
+	double sum_med[MODES] = {0}, sum_good[MODES] = {0};
+	printf("vectest: %s, sensor noise sigma %.1f grey levels; per mode: median error px, share under 0.25 px\n", argv[1], sigma);
+	printf("%-15s", "v (px/frame)");
+	for (int m = 0; m < MODES; m++)
+		if (only < 0 || m == only) printf(" | %-15s", NAME[m]);
+	printf("\n");
+	for (int vi = 0; vi < NV; vi++) {
+		if (vi == NV - 1) printf("sway 6 px 0.8 s "); else printf("(%+5.2f, %+5.2f)", V[vi][0], V[vi][1]);
+		for (int mode = 0; mode < MODES; mode++) {
+			if (only >= 0 && mode != only) continue;
 			fsr_vector_mode(mode);
 			fsrcam *c = fsr_open(W, H, cpus, 4);
 			if (!c) { fprintf(stderr, "vectest: engine did not start\n"); return 1; }
-			int ne[2] = {0, 0}, fields = 0;
+			int ne = 0, fields = 0, good = 0;
 			for (int k = 0; k < FRAMES; k++) {
-				shifted(k * V[vi][0], k * V[vi][1]);
+				/* the sway: x = 6 sin(2 pi k / 24) px, a head moving side to side in 0.8 s: velocity up to 1.57 px a frame, never constant (what an average over time lags behind) */
+				const int sway = vi == NV - 1;
+				const double px = sway ? 6.0 * sin(6.283185307179586 * k / 24.0) : k * V[vi][0], py = sway ? 0.0 : k * V[vi][1];
+				const double tvx = sway ? px - 6.0 * sin(6.283185307179586 * (k - 1) / 24.0) : V[vi][0], tvy = sway ? 0.0 : V[vi][1];
+				shifted(px, py, sigma, (uint64_t)(vi * 100 + k + 1));
 				fsr_push(c, frm);
 				struct timespec ts;
 				clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -92,26 +102,22 @@ int main(int argc, char **argv)
 				for (int by = 2; by < BH - 2; by++)
 					for (int bx = 2; bx < BW - 2; bx++) {
 						const int i = by * BW + bx;
-						const float e = (float)hypot(out[4 * i] + V[vi][0], out[4 * i + 1] + V[vi][1]);
-						errs[0][ne[0]++] = e;
-						if (energy[i] >= emed) errs[1][ne[1]++] = e;
+						errs[ne++] = (float)hypot(out[4 * i] + tvx, out[4 * i + 1] + tvy);
 					}
 			}
 			fsr_close(c);
-			if (fields != FRAMES - 1) printf("  (mode %d v %d: %d fields of %d)\n", mode, vi, fields, FRAMES - 1);
-			for (int s = 0; s < 2; s++) {
-				qsort(errs[s], (size_t)ne[s], sizeof errs[s][0], cmpf);
-				int good = 0;
-				for (int j = 0; j < ne[s]; j++) good += errs[s][j] < 0.25f;
-				const double med = ne[s] ? errs[s][ne[s] / 2] : -1;
-				sum_med[mode][s] += med;
-				snprintf(col[mode][s], sizeof col[mode][s], "%.3f %.3f %4.1f%%", med, ne[s] ? errs[s][ne[s] * 9 / 10] : -1.0, ne[s] ? 100.0 * good / ne[s] : 0.0);
-			}
+			qsort(errs, (size_t)ne, sizeof errs[0], cmpf);
+			for (int j = 0; j < ne; j++) good += errs[j] < 0.25f;
+			const double med = ne ? errs[ne / 2] : -1.0, gs = ne ? 100.0 * good / ne : 0.0;
+			sum_med[mode] += med;
+			sum_good[mode] += gs;
+			printf(" | %.3f %5.1f %%%s", med, gs, fields != FRAMES - 1 ? " !" : "  ");
 		}
-		printf("(%+5.2f, %+5.2f) all | %-24s | %-24s | %-24s\n", V[vi][0], V[vi][1], col[0][0], col[1][0], col[2][0]);
-		printf("                 text | %-24s | %-24s | %-24s\n", col[0][1], col[1][1], col[2][1]);
+		printf("\n");
 	}
-	printf("mean of the medians, all: EMA %.3f, VisionTrack %.3f, VT + still %.3f px; textured: %.3f, %.3f, %.3f px\n", sum_med[0][0] / 7, sum_med[1][0] / 7, sum_med[2][0] / 7,
-	       sum_med[0][1] / 7, sum_med[1][1] / 7, sum_med[2][1] / 7);
+	printf("%-15s", "mean");
+	for (int m = 0; m < MODES; m++)
+		if (only < 0 || m == only) printf(" | %.3f %5.1f %%  ", sum_med[m] / NV, sum_good[m] / NV);
+	printf("\n");
 	return 0;
 }
