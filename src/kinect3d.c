@@ -2589,7 +2589,7 @@ static void al_nm(double R[9], double t[3], double zf, double face_best, double 
  * translation apart (the parallax between them), which the face at one depth could not.
  * Search: the pose in use turned by a whole-picture shift, +-96 px in steps of 8 then +-8 in steps of 2 (wide
  * gradients, 6 blurs); then Nelder-Mead over the six parameters, wide then narrow gradients. Fitted on one colour
- * of a 16 px checkerboard of the picture, judged on the other: applied when the correlation there rises by 0.05. */
+ * of a 16 px checkerboard of the picture, judged on the other (al_round, below, says what it takes to apply it). */
 static void al_shift_pose(const double R[9], const double t[3], double du, double dv, double Ro[9], double to[3])
 {
 	const double w[3] = {-dv / g_cal.K[1], du / g_cal.K[0], 0.0};
@@ -2600,9 +2600,31 @@ static void al_shift_pose(const double R[9], const double t[3], double du, doubl
 	for (int i = 0; i < 3; i++) to[i] = E[3 * i] * t[0] + E[3 * i + 1] * t[1] + E[3 * i + 2] * t[2];
 }
 
-static int g_al_static_done;
+/* When it runs, and what it takes to change the pose. One solve at the start of a session was applied on a pair
+ * of frames taken while the room was not still (2026-11-18 19:34: the pose that had scored 0.59 a minute before
+ * read 0.31, and a 3.2 deg "correction" went in). So:
+ *   - only after 30 depth frames in a row with at most 48 of the 4,800 cells showing depth evidence of motion;
+ *   - a solve that gains 0.05 on its held-out half only becomes a candidate; at least 2 s later, on new frames of a
+ *     still room again, the candidate must beat the pose in use by 0.05 over every point, or it is dropped;
+ *   - once a pose is settled (a solve gained nothing, or a candidate was confirmed) later rounds, every 10 s, cost
+ *     one evaluation (the gradients and 1 correlation), and solve again only if the pose has lost 0.1 (a camera was
+ *     moved) or the A key asks. */
+static struct {
+	int settled, pending;
+	double R[9], t[3], level, t_next;
+	unsigned still_run, solves, confirmed, dropped, checks;
+} g_as;
 static double now_s(void);
-static void al_static(void)
+
+static void al_apply(const double R[9], const double t[3])
+{
+	for (int i = 0; i < 9; i++) g_cal.R[i] = (float)R[i];
+	for (int i = 0; i < 3; i++) g_cal.t[i] = (float)t[i];
+	apply_calib();
+	g_al.applied++;
+}
+
+static void al_round(void)
 {
 	double R0[9], t0[3], R[9], t[3], Rs[9], ts[3];
 	int n;
@@ -2611,7 +2633,21 @@ static void al_static(void)
 	const double t_start = now_s();
 	g_bg_zmin = 300.0f;
 	g_obj_noface = 1;
-	if (al_bg_prepare(2)) { g_bg_zmin = 1200.0f; g_obj_noface = 0; return; }
+	g_bg_part = -1;
+	if (al_bg_prepare(2)) goto out;
+	const double all_use = al_bg_ncc(R0, t0, &n);
+	g_as.checks++;
+	if (g_as.pending) { /* the candidate on frames it was not found on */
+		const double all_cand = al_bg_ncc(g_as.R, g_as.t, &n);
+		const int ok = all_cand >= all_use + 0.05;
+		printf("align: still scene: the candidate on new frames: correlation %.3f against %.3f for the pose in use (%d points): %s\n", all_cand, all_use, n,
+		       ok ? "CONFIRMED and applied" : "dropped");
+		if (ok) { al_apply(g_as.R, g_as.t); g_as.confirmed++; g_as.settled = 1; g_as.level = all_cand; } else g_as.dropped++;
+		g_as.pending = 0;
+		g_as.t_next = now_s() + (ok ? 10.0 : 2.0);
+		goto out;
+	}
+	if (g_as.settled && all_use >= g_as.level - 0.1) { g_as.t_next = now_s() + 10.0; goto out; }
 	g_bg_part = 1;
 	const double test_old = al_bg_ncc(R0, t0, &n);
 	g_bg_part = 0;
@@ -2640,23 +2676,22 @@ static void al_static(void)
 	g_bg_part = 1;
 	int ntest;
 	const double test_new = al_bg_ncc(R, t, &ntest);
-	g_bg_part = -1;
-	g_bg_zmin = 1200.0f;
-	g_obj_noface = 0;
 	double tr = 0;
 	for (int i = 0; i < 3; i++)
 		for (int k = 0; k < 3; k++) tr += R[3 * i + k] * R0[3 * i + k];
 	const double drot = acos(fmax(-1.0, fmin(1.0, 0.5 * (tr - 1.0)))) * 57.29577951308232;
 	const double dt = sqrt((t[0] - t0[0]) * (t[0] - t0[0]) + (t[1] - t0[1]) * (t[1] - t0[1]) + (t[2] - t0[2]) * (t[2] - t0[2]));
 	const int ok = ntest >= 2000 && test_new >= test_old + 0.05;
+	g_as.solves++;
 	printf("align: still scene: gradient correlation, fitted half %.3f -> %.3f, held-out half %.3f -> %.3f (%d points); whole-picture shift found (%+.0f, %+.0f) px; "
-	       "change %.2f deg %.1f mm; %.0f ms: %s\n", train_old, train_new, test_old, test_new, ntest, bu, bv, drot, dt, 1e3 * (now_s() - t_start), ok ? "APPLIED" : "kept the pose in use");
-	g_al_static_done = 1;
-	if (!ok) return;
-	for (int i = 0; i < 9; i++) g_cal.R[i] = (float)R[i];
-	for (int i = 0; i < 3; i++) g_cal.t[i] = (float)t[i];
-	apply_calib();
-	g_al.applied++;
+	       "change %.2f deg %.1f mm; %.0f ms: %s\n", train_old, train_new, test_old, test_new, ntest, bu, bv, drot, dt, 1e3 * (now_s() - t_start),
+	       ok ? "a candidate, to be confirmed on new frames" : "the pose in use stands");
+	if (ok) { memcpy(g_as.R, R, sizeof R); memcpy(g_as.t, t, sizeof t); g_as.pending = 1; g_as.t_next = now_s() + 2.0; }
+	else { g_as.settled = 1; g_as.level = all_use; g_as.t_next = now_s() + 10.0; }
+out:
+	g_bg_part = -1;
+	g_bg_zmin = 1200.0f;
+	g_obj_noface = 0;
 }
 static void al_solve(void)
 {
@@ -2975,7 +3010,7 @@ static void on_key(GLFWwindow *w, int key, int sc, int action, int mods)
 	case GLFW_KEY_V: g_arrows ^= 1; break;
 	case GLFW_KEY_G: if (p_fg) g_fg ^= 1; break;
 	case GLFW_KEY_T: g_geo ^= 1; break;
-	case GLFW_KEY_A: g_al_static_done = 0; break; /* the still-scene alignment again */
+	case GLFW_KEY_A: g_as.settled = 0; g_as.pending = 0; g_as.t_next = 0; break; /* the still-scene alignment again */
 	case GLFW_KEY_F: g_dfilter ^= 1; break;
 	case GLFW_KEY_L: if (g_flock) g_lock ^= 1; break;
 	case GLFW_KEY_K:
@@ -3509,7 +3544,14 @@ int main(int argc, char **argv)
 				if (!g_t0_face && g_fo[c].faces) g_t0_face = now_s();
 			}
 		align_step();
-		if (g_align && g_cal.ok && !g_al_static_done && g_lastk && g_lastw && nfk > 90 && nfw > 90) al_static();
+		if (d && g_align && g_cal.ok) { /* how long the room has been still: depth evidence of motion in at most 48 cells */
+			static uint8_t mv[80 * 60];
+			int ev = 0;
+			glGetTextureImage(t_dmov, 0, GL_RED, GL_UNSIGNED_BYTE, sizeof mv, mv);
+			for (int i = 0; i < 80 * 60; i++) ev += mv[i] > 200;
+			g_as.still_run = ev <= 48 ? g_as.still_run + 1 : 0;
+		}
+		if (g_align && g_cal.ok && g_lastk && g_lastw && nfk > 90 && nfw > 90 && g_as.still_run >= 30 && now_s() >= g_as.t_next) al_round();
 		if (align_dump && g_lastk && g_lastw && nfk > 150 && nfw > 150) { /* --dump-align: one frame of each camera, the point map, the pose in use */
 			char p[1024];
 			int bad = al_bg_prepare(2);
@@ -3827,8 +3869,8 @@ int main(int argc, char **argv)
 	if (ft) ft_destroy(ft);
 	if (g_align && g_vtf[0] && g_vtf[1]) {
 		printf("kinect3d: face alignment: detections still K %u W %u, moving %u, pairs %u (unpaired in time %u), kept %u, %d correspondences, "
-		       "head travel %.0f mm, solves %u, applied %u, cleared by the motor %u\n", g_al.still_k, g_al.still_w, g_al.unstill, g_al.pairs, g_al.untimed, g_al.kept, g_al.n,
-		       g_al.spread, g_al.solves, g_al.applied, g_al.resets);
+		       "head travel %.0f mm, solves %u, applied %u, cleared by the motor %u; still scene: %u checks, %u solves, %u confirmed, %u dropped\n", g_al.still_k, g_al.still_w, g_al.unstill, g_al.pairs, g_al.untimed, g_al.kept, g_al.n,
+		       g_al.spread, g_al.solves, g_al.applied, g_al.resets, g_as.checks, g_as.solves, g_as.confirmed, g_as.dropped);
 		if (g_al.applied) {
 			char ap[512];
 			snprintf(ap, sizeof ap, "%s/kinect360/calib/webcam-aligned.txt", getenv("HOME") ? getenv("HOME") : ".");

@@ -158,8 +158,11 @@ every dropped pixel for 2 frames wherever it was, which left an outline behind e
   paints near things onto far ones. The pose is now also solved from the still scene, with no face: the gradient
   correlation of the two colour cameras through the Kinect's depth, over every point from 0.3 m (near and far
   points together separate rotation from translation), a whole-picture search then Nelder-Mead over six
-  parameters, fitted on one colour of a 16 px checkerboard and judged on the other. It runs once at start (about
-  0.35 s) and on the A key, and is applied when the held-out correlation rises by 0.05.
+  parameters, fitted on one colour of a 16 px checkerboard and judged on the other. It runs only after 30 depth
+  frames of a still room (about 0.35 s, once; the A key asks again). A solve that gains 0.05 held out is only a
+  candidate: 2 s later, on new frames, it must beat the pose in use by 0.05 over every point or it is dropped. A
+  first version applied a single solve and took a 3.2 deg error from frames of a room that was not still. Once
+  settled, a check every 10 s costs one evaluation and solves again only if the pose has lost 0.1.
 
 **Face tracker.** VisionTrack's region tracker (`src/kern/track.c` with its LK, Kalman and take-back, unmodified)
 runs per camera on a worker thread; YuNet places its box on the face and places it again when the region is lost
@@ -292,8 +295,11 @@ gradient correlation has one sharp peak (0.745, the best point outside 16 px 0.5
 
 ## Not verified, or not working
 
-- The joint face plus background solve has been built but not yet seen deciding live: the one run so far had no
-  face in the webcam's view.
+- The joint face plus background solve ran in one session (5 solves, 2 applied): the held-out face error barely
+  moved (8.8 to 8.3 px) and the background correlation rose by 0.03 at most. It has not shown that it finds a
+  better pose than the still-scene solve does alone.
+- The still-scene pose moved by 1.7 deg between two sessions 8 minutes apart with no camera knowingly touched:
+  whether a camera moved or the optimum follows the scene is not settled.
 - The colour lookup's time shift is built on the measured flow but its own effect under motion is not measured (the
   rooms it ran in were nearly still); the webcam fill's remaining splatter is not separated from the two cameras'
   colour differences.
